@@ -1,0 +1,19 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug PET training",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "metatrain",
+      "args": [
+        "--debug",
+        "train",
+        "options-scratch.yaml"
+      ],
+      "cwd": "/home/ryoji/equivarient/metatrain/examples/0-beginner",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}

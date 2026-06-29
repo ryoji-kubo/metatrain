@@ -1,0 +1,185 @@
+# PET-OAM-XL-like training on the full prepared MPtrj memmap dataset, with
+# validation on the prepared 30k sAlex memmap split.
+#
+# This is not an exact reproduction of the released PET-OAM-XL training run:
+# the public checkpoint records a private PET-OMat-XL fine-tuning source, and it
+# does not store the original dataset/split files. This config is the closest
+# practical MPtrj-only training setup using the reconstructed PET-OAM-XL
+# architecture/trainer settings and the metatrain-native data prepared locally.
+
+seed: 42
+device: cuda
+base_precision: 32
+
+architecture:
+  name: pet
+
+  model:
+    cutoff: 10.0
+    num_neighbors_adaptive: 40
+    adaptive_cutoff_method: grid
+    cutoff_function: Bump
+    cutoff_width: 0.5
+    d_pet: 640
+    d_head: 640
+    d_node: 2560
+    d_feedforward: 1280
+    num_heads: 8
+    num_attention_layers: 3
+    num_gnn_layers: 5
+    normalization: RMSNorm
+    activation: SwiGLU
+    attention_temperature: 1.0
+    transformer_type: PreLN
+    featurizer_type: feedforward
+    zbl: false
+    long_range:
+      enable: false
+      use_ewald: false
+      smearing: 1.4
+      kspace_resolution: 1.33
+      interpolation_nodes: 5
+
+  training:
+    # Keep this false for a normal single-process run launched as
+    # `python -m metatrain train ...`. The released checkpoint stored
+    # `distributed: true`, but PET's distributed path expects a suitable
+    # multi-process/SLURM-style launch environment.
+    distributed: false
+    distributed_port: 39591
+
+    # The released PET-OAM-XL checkpoint stored batch_size: 4 and
+    # batch_atom_bounds: [null, 400]. Because these datasets are MemmapDataset
+    # objects, current metatrain can instead pack batches by atom count. The value
+    # 512 includes every structure in the prepared MPtrj and sAlex splits on this
+    # machine; lower it if memory is tight.
+    batch_size: 4
+    batch_atom_bounds: [null, null]
+    max_atoms_per_batch: 512
+    min_atoms_per_batch: 0
+
+    # These are the trainer values recovered from pet-oam-xl-v1.0.0.ckpt. Note
+    # that the released checkpoint was a fine-tuning checkpoint, so the learning
+    # rate is conservative for training from random initialization.
+    num_epochs: 1
+    warmup_fraction: 0.1
+    learning_rate: 5.0e-6
+    weight_decay: null
+    num_workers: null
+
+    log_interval: 1
+    checkpoint_interval: 1
+    log_mae: true
+    log_separate_blocks: false
+    best_model_metric: mae_prod
+    grad_clip_norm: 1.0
+
+    scale_targets: true
+    atomic_baseline: {}
+    fixed_scaling_weights: {}
+    per_structure_targets:
+      - non_conservative_stress
+
+    loss:
+      energy:
+        type: huber
+        weight: 1.0
+        reduction: mean
+        delta: 0.01
+        forces:
+          type: huber
+          weight: 1.0
+          reduction: mean
+          delta: 0.05
+        # Use stress, not virial, because metatrain's MemmapDataset supports
+        # stress gradients but not virial targets directly.
+        stress:
+          type: huber
+          weight: 1.0
+          reduction: mean
+          delta: 0.05
+      non_conservative_force:
+        type: huber
+        weight: 0.01
+        reduction: mean
+        delta: 0.05
+      non_conservative_stress:
+        type: huber
+        weight: 0.001
+        reduction: mean
+        delta: 0.005
+
+    # Disabled by default. The released PET-OAM-XL checkpoint was fine-tuned from
+    # a private PET-OMat-XL adaptive checkpoint:
+    # /capstor/scratch/cscs/fbigi/omat_new_style/xl/pet-omat-xl-adaptive.ckpt
+    #
+    # If you obtain an appropriate source checkpoint, set read_from to that .ckpt.
+    finetune:
+      method: full
+      read_from: null
+      config: {}
+      inherit_heads: {}
+
+training_set:
+  systems:
+    read_from: data
+    length_unit: angstrom
+  targets:
+    energy:
+      key: e
+      quantity: energy
+      unit: eV
+      forces:
+        key: f
+      stress:
+        key: s
+    non_conservative_force:
+      key: f
+      quantity: force
+      unit: eV/A
+      sample_kind: atom
+      type:
+        cartesian:
+          rank: 1
+    non_conservative_stress:
+      key: s
+      quantity: pressure
+      unit: eV/A^3
+      sample_kind: system
+      type:
+        cartesian:
+          rank: 2
+
+validation_set:
+  systems:
+    read_from: data_salex_val_30k
+    length_unit: angstrom
+  targets:
+    energy:
+      key: e
+      quantity: energy
+      unit: eV
+      forces:
+        key: f
+      stress:
+        key: s
+    non_conservative_force:
+      key: f
+      quantity: force
+      unit: eV/A
+      sample_kind: atom
+      type:
+        cartesian:
+          rank: 1
+    non_conservative_stress:
+      key: s
+      quantity: pressure
+      unit: eV/A^3
+      sample_kind: system
+      type:
+        cartesian:
+          rank: 2
+
+# Keep the full MPtrj training set intact and avoid drawing a random test split.
+test_set:
+  indices: []

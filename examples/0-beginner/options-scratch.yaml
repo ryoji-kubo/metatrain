@@ -20,3 +20,13 @@ training_set:
 
 test_set: 0.1  # 10 % of the training_set are randomly split and taken for test set
 validation_set: 0.1  # 10 % of the training_set are randomly split and for validation set
+
+
+wandb:
+  project: metatrain-pet-tutorial
+  name: pet-ethanol-scratch
+  tags:
+    - pet
+    - ethanol
+    - tutorial
+  notes: PET beginner tutorial on ethanol_reduced_100.xyz

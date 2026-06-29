@@ -1,0 +1,247 @@
+# Reconstructed from lab-cosmo/upet models/pet-oam-l-v0.1.0.ckpt.
+#
+# This is the closest config recoverable from the public checkpoint. It preserves the
+# upgraded PET architecture hypers, trainer hypers, fixed atomic baseline, target
+# scaling, and loss weights/deltas found in the checkpoint.
+#
+# Missing from the checkpoint and therefore left as placeholders:
+# - exact OMat/sAlex/MPtrj dataset files
+# - preprocessing/filtering/deduplication
+# - original train/validation/test split
+# - exact raw extxyz target keys
+# - possible earlier pretraining/fine-tuning stage, e.g. OMat -> sAlex+MPtrj
+#
+# Note: the checkpoint itself uses the older plural target name
+# "non_conservative_forces". Current metatrain examples often use the singular
+# "non_conservative_force"; keeping the plural here better matches the released
+# PET-OAM-L checkpoint/output names, but may emit a deprecation warning.
+
+architecture:
+  name: pet
+
+  model:
+    cutoff: 4.5
+    num_neighbors_adaptive: null
+    adaptive_cutoff_method: grid
+    cutoff_function: Cosine
+    cutoff_width: 0.2
+    d_pet: 512
+    d_head: 512
+    d_node: 2048
+    d_feedforward: 1024
+    num_heads: 8
+    num_attention_layers: 2
+    num_gnn_layers: 3
+    normalization: RMSNorm
+    activation: SwiGLU
+    attention_temperature: 1.0
+    transformer_type: PreLN
+    featurizer_type: feedforward
+    zbl: false
+    long_range:
+      enable: false
+      use_ewald: false
+      smearing: 1.4
+      kspace_resolution: 1.33
+      interpolation_nodes: 5
+
+  training:
+    # The checkpoint stored distributed: true. Change to false for a single-process
+    # local/VSCode debugging run.
+    distributed: true
+    distributed_port: 39591
+
+    batch_size: 16
+    num_epochs: 5
+    # The old checkpoint stored num_epochs_warmup: 0.5. In the current schema,
+    # warmup_fraction is over total training steps, so 0.5 / 5 = 0.1.
+    warmup_fraction: 0.1
+    learning_rate: 1.0e-4
+    weight_decay: null
+    log_interval: 1
+    checkpoint_interval: 1
+    log_mae: true
+    log_separate_blocks: false
+    best_model_metric: rmse_prod
+    grad_clip_norm: 1.0
+    per_structure_targets: []
+
+    scale_targets: true
+    fixed_scaling_weights:
+      energy: 0.7483054
+      non_conservative_forces: 2.8356092
+      non_conservative_stress: 0.058322243
+
+    atomic_baseline:
+      energy:
+        1: -3.031273365020752
+        2: 0.027799198403954506
+        3: -2.0805065631866455
+        4: -2.8476407527923584
+        5: -5.574077129364014
+        6: -6.980109691619873
+        7: -7.590389728546143
+        8: -6.851181983947754
+        9: -4.530276298522949
+        10: 0.3762491047382355
+        11: -1.253917932510376
+        12: -1.2814829349517822
+        13: -3.531726360321045
+        14: -5.160630702972412
+        15: -5.280490875244141
+        16: -5.172725200653076
+        17: -2.9537248611450195
+        18: 0.09453830122947693
+        19: -0.5304666757583618
+        20: -1.930411458015442
+        21: -6.348842144012451
+        22: -7.733168125152588
+        23: -8.103525161743164
+        24: -8.008460998535156
+        25: -7.960065841674805
+        26: -6.939455509185791
+        27: -5.932652950286865
+        28: -4.829807281494141
+        29: -2.913503408432007
+        30: -0.9246549010276794
+        31: -2.836353063583374
+        32: -4.337625503540039
+        33: -4.584407806396484
+        34: -4.341447353363037
+        35: -2.4020133018493652
+        36: 0.23834826052188873
+        37: -0.9047374725341797
+        38: -1.9698176383972168
+        39: -6.506529331207275
+        40: -8.434303283691406
+        41: -9.02372932434082
+        42: -9.166694641113281
+        43: -8.957742691040039
+        44: -8.005958557128906
+        45: -6.876678466796875
+        46: -5.215369701385498
+        47: -2.0827369689941406
+        48: -0.3006742298603058
+        49: -2.2366256713867188
+        50: -3.7363791465759277
+        51: -3.913025140762329
+        52: -3.5597147941589355
+        53: -1.9088412523269653
+        54: 3.221863031387329
+        55: -0.9579359889030457
+        56: -2.018587112426758
+        57: -5.003512382507324
+        58: -6.514340400695801
+        59: -4.891188144683838
+        60: -4.857710838317871
+        61: -4.921123504638672
+        62: -4.788905620574951
+        63: -10.40697956085205
+        64: -13.872601509094238
+        65: -4.780577182769775
+        66: -4.514822483062744
+        67: -4.483928680419922
+        68: -4.474108695983887
+        69: -4.49116849899292
+        70: -4.90941858291626
+        71: -4.465046405792236
+        72: -9.28829288482666
+        73: -10.675433158874512
+        74: -10.503630638122559
+        75: -10.137602806091309
+        76: -9.185210227966309
+        77: -7.9145731925964355
+        78: -6.0684638023376465
+        79: -3.0563039779663086
+        80: 0.17831231653690338
+        81: -1.9524003267288208
+        82: -3.1373376846313477
+        83: -3.589962959289551
+        89: -4.476114749908447
+        90: -7.909163475036621
+        91: -10.146844863891602
+        92: -12.388452529907227
+        93: -13.565378189086914
+        94: -14.341865539550781
+
+    loss:
+      energy:
+        type: huber
+        weight: 1.0
+        reduction: mean
+        delta: 0.015
+        forces:
+          type: huber
+          weight: 1.0
+          reduction: mean
+          delta: 0.04
+        virial:
+          type: huber
+          weight: 1.0
+          reduction: mean
+          delta: 0.03
+      non_conservative_forces:
+        type: huber
+        weight: 0.01
+        reduction: mean
+        delta: 0.01
+      non_conservative_stress:
+        type: huber
+        weight: 0.01
+        reduction: mean
+        delta: 0.004
+
+    # The public PET-OAM-L checkpoint does not encode whether this was an active
+    # fine-tuning stage from PET-OMat-L. The UPET docs describe PET-OAM as
+    # OMat -> sAlex+MPtrj, but the exact staged recipe is not recoverable here.
+    # finetune:
+    #   method: full
+    #   read_from: /path/to/pet-omat-l-v0.1.0.ckpt
+
+training_set:
+  systems:
+    read_from: /path/to/pet-oam-train.extxyz
+    reader: ase
+    length_unit: angstrom
+  targets:
+    energy:
+      quantity: energy
+      read_from: /path/to/pet-oam-train.extxyz
+      reader: ase
+      key: energy
+      unit: eV
+      forces:
+        read_from: /path/to/pet-oam-train.extxyz
+        reader: ase
+        key: forces
+      # The checkpoint stores a strain gradient on the energy target. Its old loss
+      # config called this "virial"; replace key/unit if your processed data stores
+      # stress instead.
+      virial:
+        read_from: /path/to/pet-oam-train.extxyz
+        reader: ase
+        key: virial
+    non_conservative_forces:
+      quantity: force
+      read_from: /path/to/pet-oam-train.extxyz
+      reader: ase
+      key: non_conservative_forces
+      unit: eV/A
+      sample_kind: atom
+      type:
+        cartesian:
+          rank: 1
+    non_conservative_stress:
+      quantity: pressure
+      read_from: /path/to/pet-oam-train.extxyz
+      reader: ase
+      key: non_conservative_stress
+      unit: eV/A^3
+      sample_kind: system
+      type:
+        cartesian:
+          rank: 2
+
+# Placeholders only. The original split is not stored in the checkpoint.
+validation_set: 0.1
+test_set: 0.1

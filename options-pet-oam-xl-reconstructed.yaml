@@ -1,0 +1,169 @@
+# Reconstructed from lab-cosmo/upet models/pet-oam-xl-v1.0.0.ckpt.
+#
+# This checkpoint is newer than pet-oam-l-v0.1.0.ckpt and matches the current
+# metatrain repository more closely:
+# - raw model checkpoint version: 10
+# - raw trainer checkpoint version: 12
+# - current local PET checkpoint/trainer versions: 13/13
+#
+# The values below use the current-schema hyperparameters after metatrain's checkpoint
+# upgrader is applied, plus the trainer settings stored in the checkpoint.
+#
+# Still missing from the public checkpoint:
+# - exact dataset files and raw extxyz/memmap keys
+# - preprocessing/filtering/deduplication
+# - exact validation/test split files
+# - the actual checkpoint at the original private finetune path
+#
+# The checkpoint records this original finetune source:
+# /capstor/scratch/cscs/fbigi/omat_new_style/xl/pet-omat-xl-adaptive.ckpt
+#
+# I do not know whether that private file is bit-identical to any public
+# lab-cosmo/upet PET-OMat-XL checkpoint, so this config leaves it as a placeholder.
+
+architecture:
+  name: pet
+
+  model:
+    cutoff: 10.0
+    num_neighbors_adaptive: 40
+    adaptive_cutoff_method: grid
+    cutoff_function: Bump
+    cutoff_width: 0.5
+    d_pet: 640
+    d_head: 640
+    d_node: 2560
+    d_feedforward: 1280
+    num_heads: 8
+    num_attention_layers: 3
+    num_gnn_layers: 5
+    normalization: RMSNorm
+    activation: SwiGLU
+    attention_temperature: 1.0
+    transformer_type: PreLN
+    featurizer_type: feedforward
+    zbl: false
+    long_range:
+      enable: false
+      use_ewald: false
+      smearing: 1.4
+      kspace_resolution: 1.33
+      interpolation_nodes: 5
+
+  training:
+    # Stored in the checkpoint. Use false for a local single-process debugger run.
+    distributed: true
+    distributed_port: 39591
+
+    batch_size: 4
+    batch_atom_bounds: [null, 400]
+    max_atoms_per_batch: null
+    min_atoms_per_batch: 0
+    num_epochs: 1
+    warmup_fraction: 0.1
+    learning_rate: 5.0e-6
+    weight_decay: null
+    num_workers: null
+
+    log_interval: 1
+    checkpoint_interval: 1
+    log_mae: true
+    log_separate_blocks: false
+    best_model_metric: mae_prod
+    grad_clip_norm: 1.0
+
+    scale_targets: true
+    atomic_baseline: {}
+    fixed_scaling_weights: {}
+    per_structure_targets:
+      - non_conservative_stress
+
+    loss:
+      energy:
+        type: huber
+        weight: 1.0
+        reduction: mean
+        delta: 0.01
+        forces:
+          type: huber
+          weight: 1.0
+          reduction: mean
+          delta: 0.05
+        virial:
+          type: huber
+          weight: 1.0
+          reduction: mean
+          delta: 0.05
+      non_conservative_forces:
+        type: huber
+        weight: 0.01
+        reduction: mean
+        delta: 0.05
+      non_conservative_stress:
+        type: huber
+        weight: 0.001
+        reduction: mean
+        delta: 0.005
+
+    finetune:
+      method: full
+      # Original private path stored in the checkpoint:
+      # /capstor/scratch/cscs/fbigi/omat_new_style/xl/pet-omat-xl-adaptive.ckpt
+      #
+      # Replace this with the actual PET-OMat-XL source checkpoint if you want to
+      # reproduce the PET-OAM-XL fine-tuning stage.
+      read_from: /path/to/pet-omat-xl-adaptive.ckpt
+      config: {}
+      inherit_heads: {}
+
+training_set:
+  systems:
+    read_from: /path/to/pet-oam-xl-train.extxyz
+    reader: ase
+    length_unit: angstrom
+  targets:
+    energy:
+      quantity: energy
+      read_from: /path/to/pet-oam-xl-train.extxyz
+      reader: ase
+      key: energy
+      unit: eV
+      forces:
+        read_from: /path/to/pet-oam-xl-train.extxyz
+        reader: ase
+        key: forces
+      # The checkpoint stores a strain gradient on the energy target. Its trainer loss
+      # corresponds to the "strain" gradient; use virial or stress according to how
+      # your processed dataset stores this quantity.
+      virial:
+        read_from: /path/to/pet-oam-xl-train.extxyz
+        reader: ase
+        key: virial
+    # The released checkpoint uses the plural output name. Current metatrain may warn
+    # that this quantity name is deprecated, but using it preserves the checkpoint's
+    # target/output names.
+    non_conservative_forces:
+      quantity: force
+      read_from: /path/to/pet-oam-xl-train.extxyz
+      reader: ase
+      key: non_conservative_forces
+      unit: eV/A
+      sample_kind: atom
+      type:
+        cartesian:
+          rank: 1
+    non_conservative_stress:
+      quantity: pressure
+      read_from: /path/to/pet-oam-xl-train.extxyz
+      reader: ase
+      key: non_conservative_stress
+      unit: eV/A^3
+      sample_kind: system
+      type:
+        cartesian:
+          rank: 2
+
+# Placeholders only. The original validation/test files or split policy are not stored
+# in the checkpoint.
+validation_set: 0.1
+test_set: 0.1
