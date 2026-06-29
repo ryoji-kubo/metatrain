@@ -6,6 +6,12 @@
 # the newer XL-style adaptive neighborhood/cutoff settings and the current
 # metatrain target/loss conventions.
 
+wandb:
+  project: pet-oam-mptrj
+  name: pet-oam-l
+  entity: null
+  mode: online
+
 seed: 42
 device: cuda
 base_precision: 32
