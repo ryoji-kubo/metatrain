@@ -14,6 +14,33 @@
       "cwd": "/home/ryoji/equivarient/metatrain/examples/0-beginner",
       "console": "integratedTerminal",
       "justMyCode": false
+    },
+    {
+      "name": "Debug PET-OAM-L modern MPtrj-sAlex smoke",
+      "type": "debugpy",
+      "request": "launch",
+      "python": "/home/ryoji/miniconda3/envs/metatrain-pet/bin/python",
+      "module": "metatrain",
+      "args": [
+        "--debug",
+        "train",
+        "options-pet-oam-l-modern-mptrj-salex.yaml",
+        "-o",
+        "pet-oam-l-modern-mptrj-salex-debug.pt",
+        "-r",
+        "device=cpu",
+        "-r",
+        "training_set.indices=[0,1,2,3,4,5,6,7]",
+        "-r",
+        "validation_set.indices=[0,1,2,3]",
+        "-r",
+        "architecture.training.num_epochs=1",
+        "-r",
+        "architecture.training.max_atoms_per_batch=128"
+      ],
+      "cwd": "/home/ryoji/equivarient/metatrain",
+      "console": "integratedTerminal",
+      "justMyCode": true
     }
   ]
 }
