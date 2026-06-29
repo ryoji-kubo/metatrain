@@ -1,0 +1,153 @@
+# L-sized, current-schema PET-OAM-like training on full prepared MPtrj, with
+# validation on the prepared 30k sAlex split.
+#
+# This variant uses direct force/stress prediction only:
+# - energy is trained as a scalar target
+# - force is trained through the direct non_conservative_force head
+# - stress is trained through the direct non_conservative_stress head
+# - energy gradients are not requested, so conservative force/stress losses are off
+
+seed: 42
+device: cuda
+base_precision: 32
+
+architecture:
+  name: pet
+
+  model:
+    cutoff: 10.0
+    num_neighbors_adaptive: 40
+    adaptive_cutoff_method: grid
+    cutoff_function: Bump
+    cutoff_width: 0.5
+
+    d_pet: 512
+    d_head: 512
+    d_node: 2048
+    d_feedforward: 1024
+    num_heads: 8
+    num_attention_layers: 2
+    num_gnn_layers: 3
+
+    normalization: RMSNorm
+    activation: SwiGLU
+    attention_temperature: 1.0
+    transformer_type: PreLN
+    featurizer_type: feedforward
+    zbl: false
+    long_range:
+      enable: false
+      use_ewald: false
+      smearing: 1.4
+      kspace_resolution: 1.33
+      interpolation_nodes: 5
+
+  training:
+    distributed: false
+    distributed_port: 39591
+
+    batch_size: 16
+    batch_atom_bounds: [null, null]
+    max_atoms_per_batch: 512
+    min_atoms_per_batch: 0
+
+    num_epochs: 5
+    warmup_fraction: 0.1
+    learning_rate: 1.0e-4
+    weight_decay: null
+    num_workers: null
+
+    log_interval: 1
+    checkpoint_interval: 1
+    log_mae: true
+    log_separate_blocks: false
+    best_model_metric: rmse_prod
+    grad_clip_norm: 1.0
+
+    scale_targets: true
+    atomic_baseline: {}
+    fixed_scaling_weights: {}
+    per_structure_targets:
+      - non_conservative_stress
+
+    loss:
+      energy:
+        type: huber
+        weight: 1.0
+        reduction: mean
+        delta: 0.015
+      non_conservative_force:
+        type: huber
+        weight: 1.0
+        reduction: mean
+        delta: 0.04
+      non_conservative_stress:
+        type: huber
+        weight: 0.01
+        reduction: mean
+        delta: 0.004
+
+    finetune:
+      method: full
+      read_from: null
+      config: {}
+      inherit_heads: {}
+
+training_set:
+  systems:
+    read_from: data
+    length_unit: angstrom
+  targets:
+    energy:
+      key: e
+      quantity: energy
+      unit: eV
+      forces: false
+      stress: false
+    non_conservative_force:
+      key: f
+      quantity: force
+      unit: eV/A
+      sample_kind: atom
+      type:
+        cartesian:
+          rank: 1
+    non_conservative_stress:
+      key: s
+      quantity: pressure
+      unit: eV/A^3
+      sample_kind: system
+      type:
+        cartesian:
+          rank: 2
+
+validation_set:
+  systems:
+    read_from: data_salex_val_30k
+    length_unit: angstrom
+  targets:
+    energy:
+      key: e
+      quantity: energy
+      unit: eV
+      forces: false
+      stress: false
+    non_conservative_force:
+      key: f
+      quantity: force
+      unit: eV/A
+      sample_kind: atom
+      type:
+        cartesian:
+          rank: 1
+    non_conservative_stress:
+      key: s
+      quantity: pressure
+      unit: eV/A^3
+      sample_kind: system
+      type:
+        cartesian:
+          rank: 2
+
+test_set:
+  indices: []
