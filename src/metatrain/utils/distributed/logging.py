@@ -1,3 +1,5 @@
+import os
+
 from .slurm import is_slurm, is_slurm_main_process
 
 
@@ -9,5 +11,7 @@ def is_main_process() -> bool:
     """
     if is_slurm():
         return is_slurm_main_process()
+    elif "RANK" in os.environ:
+        return os.environ["RANK"] == "0"
     else:
         return True

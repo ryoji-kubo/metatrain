@@ -1,7 +1,7 @@
 import torch
 
+from metatrain.utils.distributed.logging import is_main_process
 from metatrain.utils.distributed.slurm import initialize_slurm_nccl_process_group
-
 
 def test_initialize_slurm_nccl_process_group_single_visible_gpu(monkeypatch):
     monkeypatch.setenv("SLURM_JOB_ID", "123")
@@ -41,7 +41,6 @@ def test_initialize_slurm_nccl_process_group_single_visible_gpu(monkeypatch):
         ("init_process_group", "nccl", torch.device("cuda", 0)),
     ]
 
-
 def test_initialize_slurm_nccl_process_group_multiple_visible_gpus(monkeypatch):
     monkeypatch.setenv("SLURM_JOB_ID", "456")
     monkeypatch.setenv("SLURM_JOB_NODELIST", "node[03-04]")
@@ -78,3 +77,54 @@ def test_initialize_slurm_nccl_process_group_multiple_visible_gpus(monkeypatch):
     assert rank == 2
     assert set_device_calls == [torch.device("cuda", 2)]
     assert init_calls == [("nccl", torch.device("cuda", 2))]
+
+def test_initialize_torchrun_nccl_process_group(monkeypatch):
+    for key in [
+        "SLURM_JOB_ID",
+        "SLURM_JOB_NODELIST",
+        "SLURM_NTASKS",
+        "SLURM_PROCID",
+        "SLURM_LOCALID",
+    ]:
+        monkeypatch.delenv(key, raising=False)
+
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+
+    set_device_calls = []
+    init_calls = []
+
+    def fake_set_device(device):
+        set_device_calls.append(device)
+
+    def fake_init_process_group(*, backend, device_id):
+        init_calls.append((backend, device_id))
+
+    monkeypatch.setattr(torch.cuda, "set_device", fake_set_device)
+    monkeypatch.setattr(
+        torch.distributed, "init_process_group", fake_init_process_group
+    )
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+
+    device, world_size, rank = initialize_slurm_nccl_process_group(39591)
+
+    assert device == torch.device("cuda", 1)
+    assert world_size == 4
+    assert rank == 1
+    assert set_device_calls == [torch.device("cuda", 1)]
+    assert init_calls == [("nccl", torch.device("cuda", 1))]
+
+def test_is_main_process_with_torchrun_rank(monkeypatch):
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.delenv("SLURM_PROCID", raising=False)
+
+    monkeypatch.setenv("RANK", "1")
+    assert not is_main_process()
+
+    monkeypatch.setenv("RANK", "0")
+    assert is_main_process()
