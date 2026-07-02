@@ -7,6 +7,12 @@
 # - stress is trained through the direct non_conservative_stress head
 # - energy gradients are not requested, so conservative force/stress losses are off
 
+wandb:
+  project: pet-oam-mptrj
+  name: pet-oam-l
+  entity: null
+  mode: online
+
 seed: 42
 device: cuda
 base_precision: 32
