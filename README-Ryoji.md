@@ -11,6 +11,12 @@ python -m pip install wandb
 pip install ipykernel
 ```
 
+[July 2026] Additional installation of PyG for structure transformer.
+```bash
+pip install pyg_lib torch_scatter torch_sparse -f https://data.pyg.org/whl/torch-2.12.1+cu130.html
+pip install torch_geometric
+```
+
 ## Reproducing Native PET Tutorial (options-scratch.yaml)
 
 The documentation for how this repo works can be found in [PET_TUTORIAL_REPO_GUIDE.md](PET_TUTORIAL_REPO_GUIDE.md). For details on how training is done, refer to [PET_TUTORIAL_TRAINING_FLOW.md](PET_TUTORIAL_TRAINING_FLOW.md).

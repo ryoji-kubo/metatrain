@@ -34,7 +34,7 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
     __default_metadata__ = ModelMetadata(
         references={
             "implementation": [
-                "Adapted from /home/ryoji/equivarient/equiformer_v3/experimental/"
+                "Adapted from /home/ryoji/equiformer_v3/experimental/"
                 "models/transformer/transformer.py"
             ]
         }
@@ -171,12 +171,10 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
         device = systems[0].positions.device
         positions = torch.cat([system.positions for system in systems], dim=0)
         atomic_numbers = torch.cat([system.types for system in systems], dim=0)
-        batch = torch.cat(
-            [
-                torch.full((len(system),), i, dtype=torch.long, device=device)
-                for i, system in enumerate(systems)
-            ],
-            dim=0,
+        num_atoms = torch.tensor([len(system) for system in systems], device=device)
+        batch = torch.repeat_interleave(
+            torch.arange(len(systems), dtype=torch.long, device=device),
+            num_atoms,
         )
         cells = torch.stack([system.cell for system in systems], dim=0)
         return TransformerData(

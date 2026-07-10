@@ -141,7 +141,7 @@ neighbor-list transform, but the requested list is empty.
 This is the copied/adapted architecture from:
 
 ```text
-/home/ryoji/equivarient/equiformer_v3/experimental/models/transformer/transformer.py
+/home/ryoji/equiformer_v3/experimental/models/transformer/transformer.py
 ```
 
 The main class is:
@@ -153,8 +153,9 @@ class StructureTransformer(nn.Module)
 The implementation was made self-contained for metatrain:
 
 - removed FairChem registry usage,
-- removed PyG `to_dense_batch`,
-- added local `_to_dense_batch`,
+- restored PyG `to_dense_batch` for eager-mode dense batching,
+- kept a local `_to_dense_batch_torch` fallback for TorchScript/tracing and environments
+  without PyG,
 - added `TransformerData`,
 - made a few TorchScript/export-friendly changes.
 
@@ -190,7 +191,10 @@ TransformerData(
 ```
 
 Inside `StructureTransformer`, `_to_dense_batch` turns the ragged atom list into
-dense tensors:
+dense tensors. In normal eager training it dispatches to
+`torch_geometric.utils.to_dense_batch`; during TorchScript/tracing, or if PyG is not
+installed, it uses the local Torch fallback. The batch size is taken from the stacked
+cell tensor so dense rows stay aligned with the input systems.
 
 ```text
 pos_dense:            (batch, max_atoms, 3)
@@ -375,7 +379,9 @@ Metatrain exports the final model through `AtomisticModel.save(...)`, which scri
 the module with TorchScript. A few small changes were needed so the copied transformer
 could export:
 
-- `_to_dense_batch` avoids dynamic `*values.shape[1:]` shape construction.
+- eager-mode dense batching uses PyG `to_dense_batch`, while the scripted/traced path
+  uses `_to_dense_batch_torch`, which avoids dynamic `*values.shape[1:]` shape
+  construction.
 - attention masking uses `-1.0e30` instead of `torch.finfo(attn.dtype).min`.
 - `torch.nonzero(batch == i_system)` is used without the unsupported `as_tuple`
   keyword.
@@ -385,14 +391,16 @@ could export:
 - the nonessential `num_params` convenience property was removed.
 
 A tiny two-structure, one-epoch CPU smoke test passed through training, checkpointing,
-and final `.pt` export.
+and final `.pt` export. After restoring PyG dense batching, a focused check confirmed
+that the eager PyG path matches the local fallback, including an empty-system row, and
+that the core transformer still scripts.
 
 ## How To Start Single-GPU Training
 
 From the repository root:
 
 ```bash
-cd /home/ryoji/equivarient/metatrain
+cd /home/ryoji/metatrain
 ```
 
 Activate the environment:
@@ -472,7 +480,7 @@ instead receive one CUDA device through local rank mapping.
 Single-node, 4-GPU example:
 
 ```bash
-cd /home/ryoji/equivarient/metatrain
+cd /home/ryoji/metatrain
 conda activate metatrain-pet
 
 CUDA_VISIBLE_DEVICES=0,1,2,3 \

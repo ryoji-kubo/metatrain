@@ -92,7 +92,7 @@
         "-r",
         "architecture.training.num_workers=0"
       ],
-      "cwd": "/home/ryoji/equivarient/metatrain",
+      "cwd": "/home/ryoji/metatrain",
       "console": "integratedTerminal",
       "justMyCode": true
     }

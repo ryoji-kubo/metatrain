@@ -8,7 +8,7 @@
 
 wandb:
   project: pet-oam-mptrj
-  name: structure-transformer-metatrain
+  name: structure-transformer-metatrain-cartesian
   entity: null
   mode: online
 
@@ -34,7 +34,7 @@ architecture:
     mlp_dropout: null
 
     position_scale: 1.0
-    position_representation: fractional
+    position_representation: cartesian
     use_rotary_embeddings: true
     atom_ordering: position_ids
     center_positions: false

@@ -6,6 +6,11 @@ from torch.nn import functional as F
 
 from .coordinate_utils import cartesian_to_fractional_dense
 
+try:
+    from torch_geometric.utils import to_dense_batch as _pyg_to_dense_batch
+except ImportError:
+    _pyg_to_dense_batch = None
+
 
 class TransformerData(NamedTuple):
     atomic_numbers: torch.Tensor
@@ -14,28 +19,42 @@ class TransformerData(NamedTuple):
     cell: torch.Tensor
 
 
-def _to_dense_batch(
+def _to_dense_batch_torch(
     values: torch.Tensor,
     batch: torch.Tensor,
     fill_value: float = 0.0,
+    batch_size: int = -1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if batch_size < 0:
+        if values.shape[0] == 0:
+            batch_size = 0
+        else:
+            batch_size = int(batch.max().item()) + 1
+
     if values.shape[0] == 0:
         if values.dim() == 1:
-            return values.new_empty((0, 0)), torch.empty(
-                (0, 0), dtype=torch.bool, device=values.device
+            return values.new_full((batch_size, 0), fill_value), torch.empty(
+                (batch_size, 0), dtype=torch.bool, device=values.device
             )
-        return values.new_empty((0, 0, values.size(1))), torch.empty(
-            (0, 0), dtype=torch.bool, device=values.device
+        return (
+            values.new_full(
+                (batch_size, 0, values.size(1)),
+                fill_value,
+            ),
+            torch.empty((batch_size, 0), dtype=torch.bool, device=values.device),
         )
 
-    batch_size = int(batch.max().item()) + 1
     counts = torch.bincount(batch, minlength=batch_size)
+    if counts.shape[0] != batch_size:
+        raise ValueError("batch contains a system index outside the cell batch")
     max_count = int(counts.max().item())
     if values.dim() == 1:
         dense = values.new_full((batch_size, max_count), fill_value)
     else:
         dense = values.new_full((batch_size, max_count, values.size(1)), fill_value)
-    mask = torch.zeros((batch_size, max_count), dtype=torch.bool, device=values.device)
+    mask = torch.zeros(
+        (batch_size, max_count), dtype=torch.bool, device=values.device
+    )
 
     for i_system in range(batch_size):
         atom_indices = torch.nonzero(batch == i_system).reshape(-1)
@@ -46,6 +65,36 @@ def _to_dense_batch(
         mask[i_system, :n_atoms] = True
 
     return dense, mask
+
+
+@torch.jit.unused
+def _to_dense_batch_pyg(
+    values: torch.Tensor,
+    batch: torch.Tensor,
+    fill_value: float = 0.0,
+    batch_size: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if _pyg_to_dense_batch is None:
+        return _to_dense_batch_torch(values, batch, fill_value, batch_size)
+    if batch_size < 0:
+        return _pyg_to_dense_batch(values, batch, fill_value=fill_value)
+    return _pyg_to_dense_batch(
+        values,
+        batch,
+        fill_value=fill_value,
+        batch_size=batch_size,
+    )
+
+
+def _to_dense_batch(
+    values: torch.Tensor,
+    batch: torch.Tensor,
+    fill_value: float = 0.0,
+    batch_size: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if torch.jit.is_scripting() or torch.jit.is_tracing():
+        return _to_dense_batch_torch(values, batch, fill_value, batch_size)
+    return _to_dense_batch_pyg(values, batch, fill_value, batch_size)
 
 
 class RMSNorm(nn.Module):
@@ -384,14 +433,22 @@ class StructureTransformer(nn.Module):
             )
         batch = data.batch.long()
 
-        pos_dense, atom_mask = _to_dense_batch(data.pos, batch)
-        atomic_numbers_dense, _ = _to_dense_batch(atomic_numbers, batch, fill_value=0.0)
-        atomic_numbers_dense = atomic_numbers_dense.long()
-
-        batch_size = pos_dense.shape[0]
         cell = data.cell
         if cell.dim() == 2 and cell.shape == (3, 3):
             cell = cell.unsqueeze(0)
+        batch_size = cell.shape[0]
+
+        pos_dense, atom_mask = _to_dense_batch(
+            data.pos, batch, batch_size=batch_size
+        )
+        atomic_numbers_dense, _ = _to_dense_batch(
+            atomic_numbers,
+            batch,
+            fill_value=0.0,
+            batch_size=batch_size,
+        )
+        atomic_numbers_dense = atomic_numbers_dense.long()
+
         cell = cell.reshape(batch_size, 3, 3)
 
         frac_pos_dense: Optional[torch.Tensor] = None
