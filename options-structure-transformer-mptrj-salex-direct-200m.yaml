@@ -1,0 +1,153 @@
+# Experimental metatrain wrapper for the equiformer_v3 direct transformer.
+# 200M-scale variant matching the model shape from:
+# experimental/configs/omat24/mptrj/experiments/direct/transformer_NoDeNS_200M.yml
+
+wandb:
+  project: pet-oam-mptrj
+  name: structure-transformer-metatrain-200m
+  entity: null
+  mode: online
+
+seed: 42
+device: cuda
+base_precision: 32
+
+architecture:
+  name: experimental.structure_transformer
+
+  model:
+    # Mirrors the equiformer_v3 200M direct transformer model hyperparameters.
+    max_num_elements: 128
+    embed_dim: 1280
+    num_heads: 20
+    num_layers: 18
+    encoder_hidden_dim: 1920
+    mlp_hidden_dim: 896
+    dropout: 0.05
+    attn_dropout: null
+    residual_dropout: null
+    mlp_dropout: null
+
+    position_scale: 1.0
+    position_representation: fractional
+    use_rotary_embeddings: true
+    atom_ordering: position_ids
+    center_positions: false
+    include_cell_energy: true
+    include_cell_stress: true
+
+    regress_forces: true
+    regress_stress: true
+    direct_prediction: true
+    avg_num_nodes: 1.0
+    symmetrize_stress: false
+
+  training:
+    distributed: false
+    distributed_port: 39591
+
+    batch_size: 16
+    batch_atom_bounds: [null, null]
+    max_atoms_per_batch: 512
+    min_atoms_per_batch: 0
+
+    num_epochs: 100
+    warmup_fraction: 0.01
+    learning_rate: 1.0e-4
+    weight_decay: 0.01
+    num_workers: 8
+
+    log_interval: 1
+    checkpoint_interval: 1
+    log_mae: true
+    log_separate_blocks: false
+    best_model_metric: rmse_prod
+    grad_clip_norm: 1.0
+
+    scale_targets: true
+    atomic_baseline: {}
+    fixed_scaling_weights: {}
+    per_structure_targets:
+      - non_conservative_stress
+
+    loss:
+      energy:
+        type: huber
+        weight: 1.0
+        reduction: mean
+        delta: 0.015
+      non_conservative_force:
+        type: huber
+        weight: 1.0
+        reduction: mean
+        delta: 0.04
+      non_conservative_stress:
+        type: huber
+        weight: 0.01
+        reduction: mean
+        delta: 0.004
+
+    finetune:
+      method: full
+      read_from: null
+      config: {}
+      inherit_heads: {}
+
+training_set:
+  systems:
+    read_from: data
+    length_unit: angstrom
+  targets:
+    energy:
+      key: e
+      quantity: energy
+      unit: eV
+      forces: false
+      stress: false
+    non_conservative_force:
+      key: f
+      quantity: force
+      unit: eV/A
+      sample_kind: atom
+      type:
+        cartesian:
+          rank: 1
+    non_conservative_stress:
+      key: s
+      quantity: pressure
+      unit: eV/A^3
+      sample_kind: system
+      type:
+        cartesian:
+          rank: 2
+
+validation_set:
+  systems:
+    read_from: data_salex_val_30k
+    length_unit: angstrom
+  targets:
+    energy:
+      key: e
+      quantity: energy
+      unit: eV
+      forces: false
+      stress: false
+    non_conservative_force:
+      key: f
+      quantity: force
+      unit: eV/A
+      sample_kind: atom
+      type:
+        cartesian:
+          rank: 1
+    non_conservative_stress:
+      key: s
+      quantity: pressure
+      unit: eV/A^3
+      sample_kind: system
+      type:
+        cartesian:
+          rank: 2
+
+test_set:
+  indices: []

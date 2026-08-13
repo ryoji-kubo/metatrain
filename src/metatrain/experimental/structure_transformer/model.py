@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import metatensor.torch as mts
 import torch
@@ -53,6 +53,15 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
         transformer_hypers = dict(hypers)
         transformer_hypers.pop("symmetrize_stress", None)
         self.transformer = StructureTransformer(**transformer_hypers)
+        self.edge_vector_head = self.transformer.edge_vector_head
+        edge_vector_head_cutoff = (
+            self.transformer.edge_vector_head_cutoff if self.edge_vector_head else 1.0
+        )
+        self.requested_nl = NeighborListOptions(
+            cutoff=edge_vector_head_cutoff,
+            full_list=True,
+            strict=True,
+        )
 
         self.outputs: Dict[str, ModelOutput] = {}
         self._target_to_raw_output: Dict[str, str] = {}
@@ -122,9 +131,12 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
         )
 
     def requested_neighbor_lists(self) -> List[NeighborListOptions]:
-        # The copied transformer is a global sequence model and does not consume local
-        # neighbor lists. Returning an empty list lets the PET trainer keep the same
-        # collate stack while avoiding unnecessary neighbor-list construction.
+        if self.edge_vector_head:
+            return [self.requested_nl]
+
+        # The copied transformer is a global sequence model and, by default, does not
+        # consume local neighbor lists. Returning an empty list lets the PET trainer
+        # keep the same collate stack while avoiding unnecessary neighbor construction.
         return []
 
     def supported_outputs(self) -> Dict[str, ModelOutput]:
@@ -182,6 +194,35 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
             pos=positions,
             batch=batch,
             cell=cells,
+        )
+
+    def _systems_to_edge_data(
+        self,
+        systems: List[System],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        device = systems[0].positions.device
+        dtype = systems[0].positions.dtype
+
+        edge_vectors_list: List[torch.Tensor] = []
+        edge_centers_list: List[torch.Tensor] = []
+        edge_neighbors_list: List[torch.Tensor] = []
+        atom_offset = 0
+        for system in systems:
+            neighbor_list = system.get_neighbor_list(self.requested_nl)
+            samples = neighbor_list.samples.values.to(device=device, dtype=torch.long)
+            edge_vectors = neighbor_list.values.squeeze(-1).to(
+                device=device,
+                dtype=dtype,
+            )
+            edge_vectors_list.append(edge_vectors)
+            edge_centers_list.append(samples[:, 0] + atom_offset)
+            edge_neighbors_list.append(samples[:, 1] + atom_offset)
+            atom_offset += len(system)
+
+        return (
+            torch.cat(edge_vectors_list, dim=0),
+            torch.cat(edge_centers_list, dim=0),
+            torch.cat(edge_neighbors_list, dim=0),
         )
 
     def _system_samples(self, systems: List[System], device: torch.device) -> Labels:
@@ -286,7 +327,18 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
         selected_atoms: Optional[Labels] = None,
     ) -> Dict[str, TensorMap]:
         data = self._systems_to_transformer_data(systems)
-        raw_outputs = self.transformer(data)
+        if self.edge_vector_head:
+            edge_vectors, edge_centers, edge_neighbors = self._systems_to_edge_data(
+                systems
+            )
+            raw_outputs = self.transformer(
+                data,
+                edge_vectors=edge_vectors,
+                edge_centers=edge_centers,
+                edge_neighbors=edge_neighbors,
+            )
+        else:
+            raw_outputs = self.transformer(data)
         return_dict = self._raw_outputs_to_tensormaps(
             systems, raw_outputs, outputs, selected_atoms
         )

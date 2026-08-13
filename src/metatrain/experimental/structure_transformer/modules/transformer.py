@@ -335,6 +335,11 @@ class StructureTransformer(nn.Module):
         include_cell_stress: bool = True,
         regress_forces: bool = True,
         regress_stress: bool = False,
+        edge_vector_head: bool = False,
+        edge_vector_head_cutoff: float = 10.0,
+        edge_vector_head_hidden_dim: int = 256,
+        edge_vector_head_num_radial_basis: int = 16,
+        edge_vector_head_replace_direct: bool = False,
         direct_prediction: bool = True,
         avg_num_nodes: float = 1.0,
         d: Optional[int] = None,
@@ -358,6 +363,13 @@ class StructureTransformer(nn.Module):
                 "atom_ordering must be one of "
                 f"{sorted(valid_atom_orderings)}, got {atom_ordering!r}"
             )
+        if edge_vector_head:
+            if edge_vector_head_cutoff <= 0.0:
+                raise ValueError("edge_vector_head_cutoff must be positive")
+            if edge_vector_head_hidden_dim <= 0:
+                raise ValueError("edge_vector_head_hidden_dim must be positive")
+            if edge_vector_head_num_radial_basis <= 0:
+                raise ValueError("edge_vector_head_num_radial_basis must be positive")
 
         self.max_num_elements = max_num_elements
         self.embed_dim = embed_dim
@@ -372,6 +384,11 @@ class StructureTransformer(nn.Module):
         self.include_cell_stress = include_cell_stress
         self.regress_forces = regress_forces
         self.regress_stress = regress_stress
+        self.edge_vector_head = edge_vector_head
+        self.edge_vector_head_cutoff = float(edge_vector_head_cutoff)
+        self.edge_vector_head_hidden_dim = edge_vector_head_hidden_dim
+        self.edge_vector_head_num_radial_basis = edge_vector_head_num_radial_basis
+        self.edge_vector_head_replace_direct = edge_vector_head_replace_direct
         self.avg_num_nodes = avg_num_nodes
 
         if encoder_hidden_dim is None:
@@ -412,6 +429,130 @@ class StructureTransformer(nn.Module):
         if self.regress_stress:
             self.atom_stress_head = _build_mlp(embed_dim, encoder_hidden_dim, 9, dropout)
             self.cell_stress_head = _build_mlp(embed_dim, encoder_hidden_dim, 9, dropout)
+        if self.edge_vector_head:
+            radial_centers = torch.linspace(
+                0.0,
+                self.edge_vector_head_cutoff,
+                self.edge_vector_head_num_radial_basis,
+            )
+            self.register_buffer("edge_radial_centers", radial_centers)
+            self.edge_radial_width = self.edge_vector_head_cutoff / max(
+                self.edge_vector_head_num_radial_basis - 1,
+                1,
+            )
+            self.edge_feature_projection = nn.Linear(
+                embed_dim,
+                self.edge_vector_head_hidden_dim,
+            )
+            edge_input_dim = (
+                2 * self.edge_vector_head_hidden_dim
+                + self.edge_vector_head_num_radial_basis
+            )
+            if self.regress_forces:
+                self.edge_force_head = _build_mlp(
+                    edge_input_dim,
+                    self.edge_vector_head_hidden_dim,
+                    1,
+                    dropout,
+                )
+            if self.regress_stress:
+                self.edge_stress_head = _build_mlp(
+                    edge_input_dim,
+                    self.edge_vector_head_hidden_dim,
+                    1,
+                    dropout,
+                )
+
+    def _check_edge_inputs(
+        self,
+        edge_vectors: Optional[torch.Tensor],
+        edge_centers: Optional[torch.Tensor],
+        edge_neighbors: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if edge_vectors is None or edge_centers is None or edge_neighbors is None:
+            raise ValueError(
+                "edge_vector_head=True requires neighbor-list edge vectors, centers, "
+                "and neighbors"
+            )
+        return edge_vectors, edge_centers, edge_neighbors
+
+    def _edge_features(
+        self,
+        atom_features: torch.Tensor,
+        edge_vectors: torch.Tensor,
+        edge_centers: torch.Tensor,
+        edge_neighbors: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        edge_vectors = edge_vectors.to(dtype=atom_features.dtype)
+        edge_lengths = torch.linalg.norm(edge_vectors, dim=-1).clamp_min(1.0e-12)
+        unit_vectors = edge_vectors / edge_lengths.unsqueeze(-1)
+        centers = self.edge_radial_centers.to(
+            device=edge_vectors.device,
+            dtype=edge_vectors.dtype,
+        )
+        radial = torch.exp(
+            -0.5
+            * ((edge_lengths.unsqueeze(-1) - centers) / self.edge_radial_width).pow(2)
+        )
+        projected_atoms = self.edge_feature_projection(atom_features)
+        center_features = projected_atoms.index_select(0, edge_centers)
+        neighbor_features = projected_atoms.index_select(0, edge_neighbors)
+        features = torch.cat((center_features, neighbor_features, radial), dim=-1)
+        return features, unit_vectors, edge_lengths
+
+    def _edge_force_readout(
+        self,
+        atom_features: torch.Tensor,
+        edge_vectors: torch.Tensor,
+        edge_centers: torch.Tensor,
+        edge_neighbors: torch.Tensor,
+    ) -> torch.Tensor:
+        forces = atom_features.new_zeros((atom_features.shape[0], 3))
+        if edge_vectors.shape[0] == 0:
+            return forces
+
+        edge_features, unit_vectors, _ = self._edge_features(
+            atom_features,
+            edge_vectors,
+            edge_centers,
+            edge_neighbors,
+        )
+        edge_force = self.edge_force_head(edge_features).squeeze(-1)
+        forces.index_add_(0, edge_centers, edge_force.unsqueeze(-1) * unit_vectors)
+        return forces
+
+    def _edge_stress_readout(
+        self,
+        atom_features: torch.Tensor,
+        edge_vectors: torch.Tensor,
+        edge_centers: torch.Tensor,
+        edge_neighbors: torch.Tensor,
+        batch: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor:
+        stress = atom_features.new_zeros((batch_size, 3, 3))
+        if edge_vectors.shape[0] == 0:
+            return stress.reshape(batch_size, 9)
+
+        edge_features, unit_vectors, _ = self._edge_features(
+            atom_features,
+            edge_vectors,
+            edge_centers,
+            edge_neighbors,
+        )
+        edge_stress = self.edge_stress_head(edge_features).squeeze(-1)
+        dyads = unit_vectors.unsqueeze(-1) * unit_vectors.unsqueeze(-2)
+        edge_systems = batch.index_select(0, edge_centers)
+        stress.index_add_(0, edge_systems, edge_stress.view(-1, 1, 1) * dyads)
+
+        edge_counts = atom_features.new_zeros(batch_size)
+        edge_counts.index_add_(
+            0,
+            edge_systems,
+            atom_features.new_ones(edge_systems.shape[0]),
+        )
+        stress = stress / edge_counts.clamp_min(1.0).view(-1, 1, 1)
+        return stress.reshape(batch_size, 9)
 
     def _dense_inputs(
         self,
@@ -504,7 +645,13 @@ class StructureTransformer(nn.Module):
             inverse_atom_index_order if self.atom_ordering == "permute" else None,
         )
 
-    def forward(self, data: TransformerData) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        data: TransformerData,
+        edge_vectors: Optional[torch.Tensor] = None,
+        edge_centers: Optional[torch.Tensor] = None,
+        edge_neighbors: Optional[torch.Tensor] = None,
+    ) -> dict[str, torch.Tensor]:
         (
             pos_dense,
             atomic_numbers_dense,
@@ -553,7 +700,24 @@ class StructureTransformer(nn.Module):
 
         outputs = {"energy": energy}
         if self.regress_forces:
-            outputs["forces"] = self.force_head(atom_features)[output_atom_mask]
+            forces = self.force_head(atom_features)[output_atom_mask]
+            if self.edge_vector_head:
+                edge_vectors, edge_centers, edge_neighbors = self._check_edge_inputs(
+                    edge_vectors,
+                    edge_centers,
+                    edge_neighbors,
+                )
+                edge_forces = self._edge_force_readout(
+                    atom_features[output_atom_mask],
+                    edge_vectors,
+                    edge_centers,
+                    edge_neighbors,
+                )
+                if self.edge_vector_head_replace_direct:
+                    forces = edge_forces
+                else:
+                    forces = forces + edge_forces
+            outputs["forces"] = forces
         if self.regress_stress:
             atom_stress = self.atom_stress_head(atom_features)
             stress_mask = output_atom_mask.unsqueeze(-1).to(dtype=atom_stress.dtype)
@@ -561,6 +725,24 @@ class StructureTransformer(nn.Module):
             stress = (atom_stress * stress_mask).sum(dim=1) / num_atoms
             if self.include_cell_stress:
                 stress = stress + self.cell_stress_head(cell_features)
+            if self.edge_vector_head:
+                edge_vectors, edge_centers, edge_neighbors = self._check_edge_inputs(
+                    edge_vectors,
+                    edge_centers,
+                    edge_neighbors,
+                )
+                edge_stress = self._edge_stress_readout(
+                    atom_features[output_atom_mask],
+                    edge_vectors,
+                    edge_centers,
+                    edge_neighbors,
+                    data.batch.long(),
+                    batch_size,
+                )
+                if self.edge_vector_head_replace_direct:
+                    stress = edge_stress
+                else:
+                    stress = stress + edge_stress
             outputs["stress"] = stress
         return outputs
 

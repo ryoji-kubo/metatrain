@@ -1,0 +1,149 @@
+import copy
+
+import pytest
+import torch
+from metatomic.torch import ModelOutput, System
+
+from metatrain.experimental.structure_transformer import StructureTransformerModel
+from metatrain.utils.architectures import get_default_hypers
+from metatrain.utils.data import DatasetInfo
+from metatrain.utils.data.target_info import (
+    get_energy_target_info,
+    get_generic_target_info,
+)
+from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists
+
+
+def _model_hypers(**overrides):
+    hypers = copy.deepcopy(
+        get_default_hypers("experimental.structure_transformer")["model"]
+    )
+    hypers.update(
+        {
+            "max_num_elements": 16,
+            "embed_dim": 8,
+            "num_heads": 2,
+            "num_layers": 1,
+            "encoder_hidden_dim": 8,
+            "mlp_hidden_dim": 8,
+            "dropout": 0.0,
+            "attn_dropout": 0.0,
+            "residual_dropout": 0.0,
+            "mlp_dropout": 0.0,
+            "use_rotary_embeddings": False,
+            "atom_ordering": "none",
+            "edge_vector_head_cutoff": 3.0,
+            "edge_vector_head_hidden_dim": 8,
+            "edge_vector_head_num_radial_basis": 4,
+        }
+    )
+    hypers.update(overrides)
+    return hypers
+
+
+def _dataset_info():
+    return DatasetInfo(
+        length_unit="Angstrom",
+        atomic_types=[1, 6, 8],
+        targets={
+            "energy": get_energy_target_info(
+                "energy",
+                {"quantity": "energy", "unit": "eV"},
+            ),
+            "forces": get_generic_target_info(
+                "forces",
+                {
+                    "quantity": "force",
+                    "unit": "eV/Angstrom",
+                    "type": {"cartesian": {"rank": 1}},
+                    "num_subtargets": 1,
+                    "sample_kind": "atom",
+                },
+            ),
+            "stress": get_generic_target_info(
+                "stress",
+                {
+                    "quantity": "pressure",
+                    "unit": "GPa",
+                    "type": {"cartesian": {"rank": 2}},
+                    "num_subtargets": 1,
+                    "sample_kind": "system",
+                },
+            ),
+        },
+    )
+
+
+def _system():
+    return System(
+        types=torch.tensor([6, 8]),
+        positions=torch.tensor(
+            [[0.0, 0.0, 0.0], [1.0, 0.25, 0.0]],
+            dtype=torch.float32,
+        ),
+        cell=torch.zeros(3, 3),
+        pbc=torch.tensor([False, False, False]),
+    )
+
+
+def test_default_does_not_request_neighbor_lists():
+    model = StructureTransformerModel(_model_hypers(), _dataset_info())
+
+    assert model.requested_neighbor_lists() == []
+
+
+def test_edge_vector_options_are_inert_when_disabled():
+    model = StructureTransformerModel(
+        _model_hypers(
+            edge_vector_head=False,
+            edge_vector_head_cutoff=0.0,
+            edge_vector_head_hidden_dim=0,
+            edge_vector_head_num_radial_basis=0,
+        ),
+        _dataset_info(),
+    )
+
+    assert model.requested_neighbor_lists() == []
+
+
+def test_edge_vector_head_requests_neighbor_list():
+    hypers = _model_hypers(edge_vector_head=True)
+    model = StructureTransformerModel(hypers, _dataset_info())
+
+    requested = model.requested_neighbor_lists()
+
+    assert len(requested) == 1
+    assert requested[0].cutoff == hypers["edge_vector_head_cutoff"]
+    assert requested[0].full_list
+
+
+@pytest.mark.parametrize("replace_direct", [False, True])
+def test_edge_vector_head_forward_forces_and_stress(replace_direct):
+    model = StructureTransformerModel(
+        _model_hypers(
+            edge_vector_head=True,
+            edge_vector_head_replace_direct=replace_direct,
+        ),
+        _dataset_info(),
+    )
+    system = get_system_with_neighbor_lists(_system(), model.requested_neighbor_lists())
+
+    predictions = model(
+        [system],
+        {
+            "energy": ModelOutput(sample_kind="system"),
+            "forces": ModelOutput(sample_kind="atom"),
+            "stress": ModelOutput(sample_kind="system"),
+        },
+    )
+
+    energy = predictions["energy"].block().values
+    forces = predictions["forces"].block().values
+    stress = predictions["stress"].block().values
+
+    assert energy.shape == (1, 1)
+    assert forces.shape == (2, 3, 1)
+    assert stress.shape == (1, 3, 3, 1)
+    assert torch.isfinite(energy).all()
+    assert torch.isfinite(forces).all()
+    assert torch.isfinite(stress).all()

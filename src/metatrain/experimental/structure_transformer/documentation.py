@@ -37,6 +37,21 @@ class ModelHypers(TypedDict):
     include_cell_stress: bool = True
     regress_forces: bool = True
     regress_stress: bool = True
+    edge_vector_head: bool = False
+    """If true, add a local edge-vector readout for force and stress prediction."""
+
+    edge_vector_head_cutoff: float = 10.0
+    """Cutoff radius for the optional edge-vector prediction head."""
+
+    edge_vector_head_hidden_dim: int = 256
+    """Hidden dimension used inside the optional edge-vector prediction head."""
+
+    edge_vector_head_num_radial_basis: int = 16
+    """Number of Gaussian radial basis functions for the edge-vector head."""
+
+    edge_vector_head_replace_direct: bool = False
+    """If true, use only the edge-vector head for force and stress outputs."""
+
     direct_prediction: bool = True
     avg_num_nodes: float = 1.0
     symmetrize_stress: bool = False
