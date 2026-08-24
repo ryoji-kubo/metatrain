@@ -288,3 +288,306 @@ Focused tests:
 
 - `src/metatrain/experimental/structure_transformer/tests/test_edge_vector_head.py`
 
+## Appendix: How PET Uses Edge Vectors In Its Readout Path
+
+PET does not use edge vectors only at the final prediction head. The edge vectors
+enter the local transformer backbone first, then the target-specific readout consumes
+the resulting edge features.
+
+The path is:
+
+```text
+System neighbor list
+  -> Cartesian edge vectors and distances
+  -> adaptive/cutoff filtering
+  -> NEF edge tensor [n_atoms, max_neighbors, 3]
+  -> CartesianTransformer edge tokens
+  -> target-specific edge heads
+  -> cutoff-weighted sum over neighbors
+  -> node contribution + edge contribution
+```
+
+### 1. PET Builds Cartesian Edge Vectors
+
+In `src/metatrain/pet/modules/structures.py`, `systems_to_batch(...)` first
+concatenates the structures and reads the neighbor-list samples. It then reconstructs
+periodic displacements:
+
+```python
+cell_contributions = cell_shifts.to(cells.dtype) @ cells[0]
+edge_vectors = positions[neighbors] - positions[centers] + cell_contributions
+edge_distances = torch.norm(edge_vectors, dim=-1) + 1e-15
+```
+
+For multiple systems, PET uses the cell belonging to the center atom's system:
+
+```python
+cell_contributions = torch.einsum(
+    "ab, abc -> ac",
+    cell_shifts.to(cells.dtype),
+    cells[system_indices[centers]],
+)
+```
+
+So PET's geometric edge input is:
+
+```text
+r_ij = x_j - x_i + cell_shift @ cell
+```
+
+with both the vector `r_ij` and scalar distance `|r_ij|`.
+
+### 2. PET Reduces The Raw Neighbor Set
+
+If `num_neighbors_adaptive` is set, PET does not simply keep every edge within the
+global cutoff. It estimates an atom-wise adaptive cutoff, symmetrizes it across the
+pair, and drops edges outside that pair cutoff:
+
+```python
+pair_cutoffs = (atomic_cutoffs[centers] + atomic_cutoffs[neighbors]) / 2.0
+keep = torch.nonzero(edge_distances <= pair_cutoffs).squeeze(-1)
+edge_vectors = edge_vectors.index_select(0, keep)
+edge_distances = edge_distances.index_select(0, keep)
+```
+
+Then PET computes a smooth cutoff factor:
+
+```python
+cutoff_factors = cutoff_func_bump(edge_distances, pair_cutoffs, cutoff_width)
+```
+
+or, for fixed-cutoff configs:
+
+```python
+cutoff_factors = cutoff_func_cosine(edge_distances, pair_cutoffs, cutoff_width)
+```
+
+This matters for the comparison with the StructureTransformer diagnostic head. PET's
+successful MPtrj/sAlex config has:
+
+```yaml
+cutoff: 10.0
+num_neighbors_adaptive: 40
+cutoff_function: Bump
+cutoff_width: 0.5
+```
+
+So although the nominal cutoff is 10 A, PET is not using an unweighted sum over every
+10 A edge. It adapts the effective neighborhood and applies a smooth envelope.
+
+### 3. PET Converts Edges To NEF Format
+
+PET converts the flat edge array into a padded node-edge-feature layout:
+
+```python
+edge_vectors = edge_array_to_nef(edge_vectors, nef_indices)
+edge_distances = torch.sqrt(torch.sum(edge_vectors**2, dim=2) + 1e-15)
+cutoff_factors = edge_array_to_nef(cutoff_factors, nef_indices, nef_mask, 0.0)
+```
+
+After this conversion:
+
+```text
+edge_vectors:    [n_atoms, max_neighbors, 3]
+edge_distances:  [n_atoms, max_neighbors]
+cutoff_factors:  [n_atoms, max_neighbors]
+padding_mask:    [n_atoms, max_neighbors]
+```
+
+PET also computes a reverse-neighbor index. Between GNN layers, this lets PET replace
+or combine an `i -> j` message with the corresponding `j -> i` message.
+
+### 4. Edge Vectors Become Edge Tokens Inside CartesianTransformer
+
+In `src/metatrain/pet/modules/transformer.py`, `CartesianTransformer.forward(...)`
+embeds the Cartesian edge vector and the edge distance together:
+
+```python
+edge_embeddings = [edge_vectors, edge_distances[:, :, None]]
+edge_embeddings = torch.cat(edge_embeddings, dim=2).to(edge_vectors.dtype)
+edge_embeddings = self.edge_embedder(edge_embeddings)
+```
+
+The `edge_embedder` is:
+
+```python
+self.edge_embedder = nn.Linear(4, d_model)
+```
+
+So each edge token initially receives:
+
+```text
+[dx, dy, dz, distance] -> Linear(4, d_model)
+```
+
+On the first PET GNN layer, this geometric edge embedding is concatenated with the
+current edge/message embedding:
+
+```python
+edge_tokens = torch.cat([edge_embeddings, input_messages], dim=2)
+```
+
+On later GNN layers, PET also concatenates neighbor element embeddings:
+
+```python
+neighbor_elements_embeddings = self.neighbor_embedder(element_indices_neighbors)
+edge_tokens = torch.cat(
+    [edge_embeddings, neighbor_elements_embeddings, input_messages],
+    dim=2,
+)
+```
+
+Then PET compresses these into transformer edge tokens:
+
+```python
+edge_tokens = self.compress(edge_tokens)
+```
+
+The local transformer attends over one center-node token plus that atom's edge tokens.
+The attention mask uses the cutoff factors:
+
+```python
+cutoff_factors = torch.cat([central_token_factor, cutoff_factors], dim=1)
+cutoff_factors[~total_padding_mask] = 0.0
+```
+
+Inside attention, PET adds `log(cutoff_factors)` to the attention weights. Thus edge
+distance/cutoff affects the transformer attention, not just the final readout.
+
+### 5. PET Reuses Edge Vectors At Every GNN Layer
+
+In `src/metatrain/pet/model.py`, `_calculate_features(...)` passes the same
+`edge_vectors`, `edge_distances`, `padding_mask`, and `cutoff_factors` into each
+`CartesianTransformer` layer:
+
+```python
+output_node_embeddings, output_edge_embeddings = gnn_layer(
+    input_node_embeddings,
+    input_edge_embeddings,
+    inputs["element_indices_neighbors"],
+    inputs["edge_vectors"],
+    inputs["padding_mask"],
+    inputs["edge_distances"],
+    inputs["cutoff_factors"],
+    use_manual_attention,
+)
+```
+
+After each GNN layer, PET uses the reverse-neighbor index to feed reversed edge
+messages into the next layer:
+
+```python
+new_input_edge_embeddings = output_edge_embeddings.reshape(...)[
+    inputs["reverse_neighbor_index"]
+].reshape(...)
+```
+
+For the `feedforward` featurizer used in the successful PET run, PET combines:
+
+```text
+previous edge message
++ current output edge embedding
++ MLP([output_edge_embedding, reversed_output_edge_embedding])
+```
+
+This is much richer than a final one-shot edge readout.
+
+### 6. PET Has Target-Specific Node Heads And Edge Heads
+
+For every target, PET creates both node and edge heads in `_add_output(...)`:
+
+```python
+self.node_heads[target_name] = ModuleList([... Linear(d_node, d_head) ...])
+self.edge_heads[target_name] = ModuleList([... Linear(d_pet, d_head) ...])
+```
+
+It also creates target-specific final linear layers for both paths:
+
+```python
+self.node_last_layers[target_name] = ModuleList([... Linear(d_head, prod(shape)) ...])
+self.edge_last_layers[target_name] = ModuleList([... Linear(d_head, prod(shape)) ...])
+```
+
+For `non_conservative_force`, `shape` is the Cartesian rank-1 target shape:
+
+```text
+[3, 1]
+```
+
+For `non_conservative_stress`, `shape` is the Cartesian rank-2 target shape:
+
+```text
+[3, 3, 1]
+```
+
+This means PET's edge branch does not predict just a scalar coefficient that is later
+multiplied by a unit vector. The edge branch can directly predict target components
+from edge features that already encode `[dx, dy, dz, distance]`.
+
+### 7. PET Sums Edge Contributions With Cutoff Weighting
+
+PET first applies the target-specific edge head:
+
+```python
+edge_last_layer_features = edge_head(edge_features_list[i])
+```
+
+Then the target-specific final edge layer predicts per-edge target-shaped values:
+
+```python
+edge_atomic_predictions = edge_last_layer_by_block(edge_last_layer_features)
+```
+
+PET masks padded edges and sums real edge contributions onto the center atom with the
+smooth cutoff factors:
+
+```python
+edge_atomic_predictions = torch.where(
+    ~expanded_padding_mask, 0.0, edge_atomic_predictions
+)
+edge_atomic_predictions = (
+    edge_atomic_predictions * cutoff_factors[:, :, None]
+).sum(dim=1)
+```
+
+The node branch makes a per-atom prediction too. PET adds both:
+
+```python
+atomic_prediction = node_atomic_prediction + edge_atomic_prediction
+```
+
+Finally:
+
+- atom-level targets such as `non_conservative_force` remain per atom;
+- system-level targets such as `non_conservative_stress` are summed over atoms;
+- `non_conservative_stress` also goes through PET's stress post-processing path.
+
+### 8. Why This Is Different From The StructureTransformer Diagnostic Head
+
+The diagnostic StructureTransformer edge head currently does this:
+
+```text
+final atom features + edge radial basis
+  -> scalar edge coefficient
+  -> coefficient * unit edge vector
+  -> scatter-add to center atom
+```
+
+PET does this instead:
+
+```text
+[dx, dy, dz, distance]
+  -> edge token inside every CartesianTransformer layer
+  -> attention with cutoff-factor masking
+  -> reverse-edge message exchange between layers
+  -> target-specific edge head
+  -> target-shaped edge prediction
+  -> cutoff-weighted neighbor sum
+  -> add node contribution
+```
+
+So PET's advantage is not merely "it has edge vectors in the readout." PET uses edge
+vectors throughout local message construction, attention, edge-feature evolution, and
+target-specific edge readout. The StructureTransformer diagnostic head tested only
+the last part, and in an especially simple form.
+
