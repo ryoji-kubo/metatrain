@@ -1,3 +1,4 @@
+import math
 from typing import NamedTuple, Optional
 
 import torch
@@ -153,7 +154,166 @@ def _apply_rotary_emb(
     return x_real.view(batch_size, num_heads, seq_len, head_dim).type_as(x)
 
 
-def _atom_reordering(frac_coords: torch.Tensor, atom_mask: torch.Tensor) -> torch.Tensor:
+def _canonical_frac_coords(frac_coords: torch.Tensor, eps: float) -> torch.Tensor:
+    frac_coords = torch.remainder(frac_coords, 1.0)
+    if eps > 0.0:
+        frac_coords = torch.where(
+            (frac_coords < eps) | (frac_coords > 1.0 - eps),
+            torch.zeros_like(frac_coords),
+            frac_coords,
+        )
+    return frac_coords
+
+
+def _scalar_embedding(
+    scalars: torch.Tensor,
+    dim: int,
+    scalar_scale: float,
+) -> torch.Tensor:
+    if dim % 2 != 0:
+        raise ValueError("scalar embedding requires an even embedding dimension")
+    half_dim = dim // 2
+    dtype = scalars.dtype
+    frequencies = 10000.0 ** (
+        -torch.arange(half_dim, device=scalars.device, dtype=dtype) / half_dim
+    )
+    angles = scalar_scale * scalars.unsqueeze(-1) * frequencies
+    return torch.cat((angles.cos(), angles.sin()), dim=-1)
+
+
+def _precompute_periodic_3d_rope_harmonics(
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if head_dim < 2:
+        raise ValueError("periodic coordinate RoPE requires head_dim >= 2")
+    n_pairs = head_dim // 2
+    pair_index = torch.arange(n_pairs, dtype=torch.long)
+    pair_axis = pair_index % 3
+    harmonic = (pair_index // 3 + 1).float()
+    return pair_axis, harmonic
+
+
+def _apply_periodic_3d_rotary_emb(
+    x: torch.Tensor,
+    frac_coords: torch.Tensor,
+    pair_axis: torch.Tensor,
+    harmonic: torch.Tensor,
+    wrap_eps: float,
+) -> torch.Tensor:
+    num_atoms = x.shape[-2]
+    head_dim = x.shape[-1]
+    n_pairs = head_dim // 2
+    rotary_dim = 2 * n_pairs
+    if num_atoms == 0 or rotary_dim == 0:
+        return x
+
+    pair_axis = pair_axis.to(device=frac_coords.device)
+    harmonic = harmonic.to(device=frac_coords.device, dtype=torch.float32)
+    frac_coords = _canonical_frac_coords(frac_coords.float(), wrap_eps)
+
+    angles = (
+        2.0
+        * math.pi
+        * frac_coords[..., pair_axis]
+        * harmonic.view(1, 1, n_pairs)
+    )
+    cos = angles.cos().unsqueeze(1)
+    sin = angles.sin().unsqueeze(1)
+
+    x_rot = x[..., :rotary_dim].float()
+    x_even = x_rot[..., 0::2]
+    x_odd = x_rot[..., 1::2]
+    y_even = x_even * cos - x_odd * sin
+    y_odd = x_even * sin + x_odd * cos
+    y_rot = torch.stack((y_even, y_odd), dim=-1).flatten(-2)
+
+    if rotary_dim < head_dim:
+        y = torch.cat((y_rot, x[..., rotary_dim:].float()), dim=-1)
+    else:
+        y = y_rot
+    return y.to(dtype=x.dtype)
+
+
+class TorusRelativeCoordEncoder(nn.Module):
+    """Periodic, translation-invariant coordinate encoder on the fractional torus."""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        hidden_dim: int,
+        num_harmonics: int = 4,
+        wrap_eps: float = 1.0e-6,
+    ):
+        super().__init__()
+        if num_harmonics < 1:
+            raise ValueError("num_harmonics must be >= 1")
+        if wrap_eps < 0.0:
+            raise ValueError("wrap_eps must be non-negative")
+        self.embed_dim = embed_dim
+        self.num_harmonics = num_harmonics
+        self.wrap_eps = wrap_eps
+        periodic_feature_dim = 3 * 2 * num_harmonics
+        self.pair_mlp = nn.Sequential(
+            nn.Linear(periodic_feature_dim + embed_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+
+    def forward(
+        self,
+        frac_coords: torch.Tensor,
+        atom_features: torch.Tensor,
+        atom_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if frac_coords.ndim != 3 or frac_coords.shape[-1] != 3:
+            raise ValueError("frac_coords must have shape [B, N, 3]")
+        if atom_features.ndim != 3:
+            raise ValueError("atom_features must have shape [B, N, D]")
+        if atom_features.shape[:2] != frac_coords.shape[:2]:
+            raise ValueError("atom_features and frac_coords must share [B, N]")
+        if atom_features.shape[-1] != self.embed_dim:
+            raise ValueError("atom_features has the wrong embedding dimension")
+
+        batch_size, num_atoms, _ = frac_coords.shape
+        if num_atoms == 0:
+            return atom_features.new_zeros((batch_size, 0, self.embed_dim))
+
+        out_dtype = atom_features.dtype
+        u = _canonical_frac_coords(frac_coords.float(), self.wrap_eps)
+        delta = u.unsqueeze(2) - u.unsqueeze(1)
+        harmonics = torch.arange(
+            1,
+            self.num_harmonics + 1,
+            device=u.device,
+            dtype=u.dtype,
+        )
+        angles = 2.0 * math.pi * delta.unsqueeze(-1) * harmonics.view(
+            1, 1, 1, 1, -1
+        )
+        pair_features = torch.cat((angles.cos(), angles.sin()), dim=-1)
+        pair_features = pair_features.flatten(start_dim=-2)
+
+        neighbor_features = atom_features.to(dtype=pair_features.dtype).unsqueeze(1)
+        neighbor_features = neighbor_features.expand(-1, num_atoms, -1, -1)
+        pair_input = torch.cat((pair_features, neighbor_features), dim=-1)
+        messages = self.pair_mlp(pair_input)
+
+        valid_pair = atom_mask.unsqueeze(1) & atom_mask.unsqueeze(2)
+        self_mask = torch.eye(num_atoms, device=atom_mask.device, dtype=torch.bool)
+        valid_pair = valid_pair & ~self_mask.view(1, num_atoms, num_atoms)
+        messages = messages.masked_fill(~valid_pair.unsqueeze(-1), 0.0)
+        denom = valid_pair.sum(dim=2).clamp_min(1).unsqueeze(-1)
+        coord_features = messages.sum(dim=2) / denom.to(dtype=messages.dtype)
+        coord_features = coord_features * atom_mask.unsqueeze(-1).to(
+            dtype=coord_features.dtype
+        )
+        return coord_features.to(dtype=out_dtype)
+
+
+def _atom_reordering(
+    frac_coords: torch.Tensor,
+    atom_mask: torch.Tensor,
+) -> torch.Tensor:
     values = (
         100.0 * frac_coords[:, :, 0]
         + 10.0 * frac_coords[:, :, 1]
@@ -191,16 +351,26 @@ class MultiHeadAttention(nn.Module):
         num_heads: int,
         dropout: float,
         use_rotary_embeddings: bool,
+        use_periodic_rope: bool = False,
+        fractional_wrap_eps: float = 1.0e-6,
     ):
         super().__init__()
         if embed_dim % num_heads != 0:
             raise ValueError("embed_dim must be divisible by num_heads")
         head_dim = embed_dim // num_heads
+        if use_rotary_embeddings and use_periodic_rope:
+            raise ValueError(
+                "use_rotary_embeddings and use_periodic_rope are mutually exclusive"
+            )
         if use_rotary_embeddings and head_dim % 2 != 0:
             raise ValueError("RoPE requires an even per-head dimension")
+        if use_periodic_rope and head_dim < 2:
+            raise ValueError("periodic coordinate RoPE requires head_dim >= 2")
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.use_rotary_embeddings = use_rotary_embeddings
+        self.use_periodic_rope = use_periodic_rope
+        self.fractional_wrap_eps = fractional_wrap_eps
         self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
@@ -209,12 +379,18 @@ class MultiHeadAttention(nn.Module):
         self.out_proj = nn.Linear(embed_dim, embed_dim)
         self.attn_drop = nn.Dropout(dropout)
 
+        if self.use_periodic_rope:
+            pair_axis, harmonic = _precompute_periodic_3d_rope_harmonics(head_dim)
+            self.register_buffer("periodic_rope_pair_axis", pair_axis, persistent=False)
+            self.register_buffer("periodic_rope_harmonic", harmonic, persistent=False)
+
     def forward(
         self,
         x: torch.Tensor,
         valid_mask: torch.Tensor,
         rotary_pe_cplx: Optional[torch.Tensor] = None,
         rotary_position_ids: Optional[torch.Tensor] = None,
+        periodic_rope_coords: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, embed_dim = x.shape
         q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
@@ -228,10 +404,45 @@ class MultiHeadAttention(nn.Module):
         if self.use_rotary_embeddings:
             if rotary_pe_cplx is None:
                 raise ValueError("rotary_pe_cplx is required when RoPE is enabled")
-            q = _apply_rotary_emb(q, rotary_pe_cplx, rotary_position_ids)
-            k = _apply_rotary_emb(k, rotary_pe_cplx, rotary_position_ids)
+            q_for_scores = _apply_rotary_emb(q, rotary_pe_cplx, rotary_position_ids)
+            k_for_scores = _apply_rotary_emb(k, rotary_pe_cplx, rotary_position_ids)
+        elif self.use_periodic_rope:
+            if periodic_rope_coords is None:
+                raise ValueError(
+                    "periodic_rope_coords is required when periodic RoPE is enabled"
+                )
+            if periodic_rope_coords.shape[:2] != (batch_size, seq_len - 1):
+                raise ValueError(
+                    "periodic_rope_coords must have shape [B, seq_len - 1, 3]"
+                )
+            q_for_scores = q.clone()
+            k_for_scores = k.clone()
+            q_for_scores[:, :, 1:, :] = _apply_periodic_3d_rotary_emb(
+                q[:, :, 1:, :],
+                periodic_rope_coords,
+                self.periodic_rope_pair_axis,
+                self.periodic_rope_harmonic,
+                self.fractional_wrap_eps,
+            )
+            k_for_scores[:, :, 1:, :] = _apply_periodic_3d_rotary_emb(
+                k[:, :, 1:, :],
+                periodic_rope_coords,
+                self.periodic_rope_pair_axis,
+                self.periodic_rope_harmonic,
+                self.fractional_wrap_eps,
+            )
+        else:
+            q_for_scores = q
+            k_for_scores = k
 
-        attn = torch.matmul(q.float(), k.float().transpose(-2, -1)) * self.scale
+        attn = torch.matmul(
+            q_for_scores.float(), k_for_scores.float().transpose(-2, -1)
+        )
+        if self.use_periodic_rope:
+            unrotated_attn = torch.matmul(q.float(), k.float().transpose(-2, -1))
+            attn[:, :, 0, :] = unrotated_attn[:, :, 0, :]
+            attn[:, :, :, 0] = unrotated_attn[:, :, :, 0]
+        attn = attn * self.scale
         attn = attn.masked_fill(
             ~valid_mask.view(batch_size, 1, 1, seq_len),
             -1.0e30,
@@ -271,6 +482,8 @@ class TransformerBlock(nn.Module):
         mlp_hidden_dim: Optional[int],
         mlp_dropout: float,
         use_rotary_embeddings: bool,
+        use_periodic_rope: bool = False,
+        fractional_wrap_eps: float = 1.0e-6,
     ):
         super().__init__()
         self.attn_norm = RMSNorm(embed_dim)
@@ -279,6 +492,8 @@ class TransformerBlock(nn.Module):
             num_heads,
             attn_dropout,
             use_rotary_embeddings,
+            use_periodic_rope,
+            fractional_wrap_eps,
         )
         self.attn_drop = nn.Dropout(residual_dropout)
         self.mlp_norm = RMSNorm(embed_dim)
@@ -291,6 +506,7 @@ class TransformerBlock(nn.Module):
         valid_mask: torch.Tensor,
         rotary_pe_cplx: Optional[torch.Tensor] = None,
         rotary_position_ids: Optional[torch.Tensor] = None,
+        periodic_rope_coords: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = x + self.attn_drop(
             self.attn(
@@ -298,6 +514,7 @@ class TransformerBlock(nn.Module):
                 valid_mask,
                 rotary_pe_cplx,
                 rotary_position_ids,
+                periodic_rope_coords,
             )
         )
         x = x + self.mlp_drop(self.mlp(self.mlp_norm(x)))
@@ -328,9 +545,16 @@ class StructureTransformer(nn.Module):
         mlp_dropout: Optional[float] = None,
         position_scale: float = 1.0,
         position_representation: str = "cartesian",
+        coordinate_encoding: str = "absolute_mlp",
+        coord_num_harmonics: int = 4,
         use_rotary_embeddings: bool = False,
+        use_periodic_rope: bool = False,
         atom_ordering: str = "none",
         center_positions: bool = True,
+        fractional_wrap_eps: float = 1.0e-6,
+        atom_embedding_type: str = "embedding",
+        atomic_number_scale: float = 118.0,
+        atom_scalar_embedding_scale: float = 1000.0,
         include_cell_energy: bool = True,
         include_cell_stress: bool = True,
         regress_forces: bool = True,
@@ -348,14 +572,17 @@ class StructureTransformer(nn.Module):
         if d is not None:
             embed_dim = d
         if not direct_prediction:
-            raise ValueError("StructureTransformer currently supports direct_prediction only")
+            raise ValueError(
+                "StructureTransformer currently supports direct_prediction only"
+            )
         if embed_dim % num_heads != 0:
             raise ValueError("embed_dim must be divisible by num_heads")
         valid_position_representations = {"cartesian", "fractional"}
         if position_representation not in valid_position_representations:
             raise ValueError(
                 "position_representation must be one of "
-                f"{sorted(valid_position_representations)}, got {position_representation!r}"
+                f"{sorted(valid_position_representations)}, "
+                f"got {position_representation!r}"
             )
         valid_atom_orderings = {"none", "position_ids", "permute"}
         if atom_ordering not in valid_atom_orderings:
@@ -363,6 +590,39 @@ class StructureTransformer(nn.Module):
                 "atom_ordering must be one of "
                 f"{sorted(valid_atom_orderings)}, got {atom_ordering!r}"
             )
+        valid_coordinate_encodings = {"absolute_mlp", "v37_torus_relative"}
+        if coordinate_encoding not in valid_coordinate_encodings:
+            raise ValueError(
+                "coordinate_encoding must be one of "
+                f"{sorted(valid_coordinate_encodings)}, got {coordinate_encoding!r}"
+            )
+        valid_atom_embedding_types = {"embedding", "scalar"}
+        if atom_embedding_type not in valid_atom_embedding_types:
+            raise ValueError(
+                "atom_embedding_type must be one of "
+                f"{sorted(valid_atom_embedding_types)}, got {atom_embedding_type!r}"
+            )
+        if use_rotary_embeddings and use_periodic_rope:
+            raise ValueError(
+                "use_rotary_embeddings and use_periodic_rope are mutually exclusive"
+            )
+        if (
+            coordinate_encoding == "v37_torus_relative" or use_periodic_rope
+        ) and atom_ordering != "none":
+            raise ValueError(
+                "v37_torus_relative coordinates and periodic RoPE require "
+                "atom_ordering='none' to avoid index/order canonicalization"
+            )
+        if coord_num_harmonics < 1:
+            raise ValueError("coord_num_harmonics must be >= 1")
+        if fractional_wrap_eps < 0.0:
+            raise ValueError("fractional_wrap_eps must be non-negative")
+        if atom_embedding_type == "scalar" and embed_dim % 2 != 0:
+            raise ValueError("scalar atom embedding requires an even embed_dim")
+        if atomic_number_scale <= 0.0:
+            raise ValueError("atomic_number_scale must be positive")
+        if atom_scalar_embedding_scale <= 0.0:
+            raise ValueError("atom_scalar_embedding_scale must be positive")
         if edge_vector_head:
             if edge_vector_head_cutoff <= 0.0:
                 raise ValueError("edge_vector_head_cutoff must be positive")
@@ -377,9 +637,16 @@ class StructureTransformer(nn.Module):
         self.num_layers = num_layers
         self.position_scale = position_scale
         self.position_representation = position_representation
+        self.coordinate_encoding = coordinate_encoding
+        self.coord_num_harmonics = coord_num_harmonics
         self.use_rotary_embeddings = use_rotary_embeddings
+        self.use_periodic_rope = use_periodic_rope
         self.atom_ordering = atom_ordering
         self.center_positions = center_positions
+        self.fractional_wrap_eps = float(fractional_wrap_eps)
+        self.atom_embedding_type = atom_embedding_type
+        self.atomic_number_scale = float(atomic_number_scale)
+        self.atom_scalar_embedding_scale = float(atom_scalar_embedding_scale)
         self.include_cell_energy = include_cell_energy
         self.include_cell_stress = include_cell_stress
         self.regress_forces = regress_forces
@@ -400,10 +667,32 @@ class StructureTransformer(nn.Module):
         if mlp_dropout is None:
             mlp_dropout = dropout
 
-        self.atom_embedding = nn.Embedding(max_num_elements, embed_dim, padding_idx=0)
-        self.position_encoder = _build_mlp(3, encoder_hidden_dim, embed_dim, dropout)
+        if self.atom_embedding_type == "embedding":
+            self.atom_embedding = nn.Embedding(
+                max_num_elements, embed_dim, padding_idx=0
+            )
+        else:
+            self.atom_scalar_encoder = _build_mlp(
+                embed_dim,
+                encoder_hidden_dim,
+                embed_dim,
+                dropout,
+            )
+        if self.coordinate_encoding == "v37_torus_relative":
+            self.position_encoder = TorusRelativeCoordEncoder(
+                embed_dim=embed_dim,
+                hidden_dim=encoder_hidden_dim,
+                num_harmonics=coord_num_harmonics,
+                wrap_eps=self.fractional_wrap_eps,
+            )
+        else:
+            self.position_encoder = _build_mlp(
+                3, encoder_hidden_dim, embed_dim, dropout
+            )
         self.cell_token_encoder = _build_mlp(9, encoder_hidden_dim, embed_dim, dropout)
-        self.cell_condition_encoder = _build_mlp(9, encoder_hidden_dim, embed_dim, dropout)
+        self.cell_condition_encoder = _build_mlp(
+            9, encoder_hidden_dim, embed_dim, dropout
+        )
 
         self.blocks = nn.ModuleList(
             [
@@ -415,6 +704,8 @@ class StructureTransformer(nn.Module):
                     mlp_hidden_dim=mlp_hidden_dim,
                     mlp_dropout=mlp_dropout,
                     use_rotary_embeddings=use_rotary_embeddings,
+                    use_periodic_rope=use_periodic_rope,
+                    fractional_wrap_eps=self.fractional_wrap_eps,
                 )
                 for _ in range(num_layers)
             ]
@@ -427,8 +718,12 @@ class StructureTransformer(nn.Module):
         if self.regress_forces:
             self.force_head = _build_mlp(embed_dim, encoder_hidden_dim, 3, dropout)
         if self.regress_stress:
-            self.atom_stress_head = _build_mlp(embed_dim, encoder_hidden_dim, 9, dropout)
-            self.cell_stress_head = _build_mlp(embed_dim, encoder_hidden_dim, 9, dropout)
+            self.atom_stress_head = _build_mlp(
+                embed_dim, encoder_hidden_dim, 9, dropout
+            )
+            self.cell_stress_head = _build_mlp(
+                embed_dim, encoder_hidden_dim, 9, dropout
+            )
         if self.edge_vector_head:
             radial_centers = torch.linspace(
                 0.0,
@@ -462,6 +757,22 @@ class StructureTransformer(nn.Module):
                     1,
                     dropout,
                 )
+
+    def _encode_atoms(
+        self,
+        atomic_numbers_dense: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if self.atom_embedding_type == "embedding":
+            return self.atom_embedding(atomic_numbers_dense)
+        scaled_atomic_numbers = atomic_numbers_dense.to(dtype=dtype)
+        scaled_atomic_numbers = scaled_atomic_numbers / self.atomic_number_scale
+        atom_embedding = _scalar_embedding(
+            scaled_atomic_numbers,
+            self.embed_dim,
+            self.atom_scalar_embedding_scale,
+        )
+        return self.atom_scalar_encoder(atom_embedding)
 
     def _check_edge_inputs(
         self,
@@ -563,6 +874,7 @@ class StructureTransformer(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
         Optional[torch.Tensor],
         Optional[torch.Tensor],
     ]:
@@ -592,9 +904,19 @@ class StructureTransformer(nn.Module):
 
         cell = cell.reshape(batch_size, 3, 3)
 
+        needs_fractional = (
+            self.position_representation == "fractional"
+            or self.atom_ordering != "none"
+            or self.coordinate_encoding == "v37_torus_relative"
+            or self.use_periodic_rope
+        )
         frac_pos_dense: Optional[torch.Tensor] = None
-        if self.position_representation == "fractional":
+        if needs_fractional:
             frac_pos_dense = cartesian_to_fractional_dense(pos_dense, cell)
+
+        if self.position_representation == "fractional":
+            if frac_pos_dense is None:
+                raise RuntimeError("fractional coordinates were not computed")
             pos_dense = frac_pos_dense
 
         atom_index_order: Optional[torch.Tensor] = None
@@ -603,12 +925,13 @@ class StructureTransformer(nn.Module):
         output_atom_mask = atom_mask
         if self.atom_ordering != "none":
             if frac_pos_dense is None:
-                frac_pos_dense = cartesian_to_fractional_dense(pos_dense, cell)
+                raise RuntimeError("atom ordering requires fractional coordinates")
             atom_index_order = _atom_reordering(frac_pos_dense, atom_mask)
             inverse_atom_index_order = _invert_permutation(atom_index_order)
 
             if self.atom_ordering == "permute":
                 pos_dense = _gather_atom_features(pos_dense, atom_index_order)
+                frac_pos_dense = _gather_atom_features(frac_pos_dense, atom_index_order)
                 atomic_numbers_dense = torch.gather(
                     atomic_numbers_dense,
                     dim=1,
@@ -633,10 +956,18 @@ class StructureTransformer(nn.Module):
             pos_dense = (pos_dense - center) * mask
 
         pos_dense = pos_dense / self.position_scale
+        if frac_pos_dense is None:
+            frac_pos_dense = pos_dense.new_zeros(pos_dense.shape)
+        else:
+            frac_pos_dense = _canonical_frac_coords(
+                frac_pos_dense,
+                self.fractional_wrap_eps,
+            )
         cell_flat = cell.reshape(batch_size, 9) / self.position_scale
 
         return (
             pos_dense,
+            frac_pos_dense,
             atomic_numbers_dense,
             atom_mask,
             output_atom_mask,
@@ -654,6 +985,7 @@ class StructureTransformer(nn.Module):
     ) -> dict[str, torch.Tensor]:
         (
             pos_dense,
+            frac_pos_dense,
             atomic_numbers_dense,
             atom_mask,
             output_atom_mask,
@@ -663,9 +995,16 @@ class StructureTransformer(nn.Module):
         ) = self._dense_inputs(data)
         batch_size, max_atoms, _ = pos_dense.shape
 
-        atom_tokens = self.position_encoder(pos_dense) + self.atom_embedding(
-            atomic_numbers_dense
-        )
+        atom_identity = self._encode_atoms(atomic_numbers_dense, pos_dense.dtype)
+        if self.coordinate_encoding == "v37_torus_relative":
+            atom_positions = self.position_encoder(
+                frac_pos_dense,
+                atom_identity,
+                atom_mask,
+            )
+        else:
+            atom_positions = self.position_encoder(pos_dense)
+        atom_tokens = atom_positions + atom_identity
         atom_tokens = atom_tokens * atom_mask.unsqueeze(-1).to(dtype=atom_tokens.dtype)
 
         cell_token = self.cell_token_encoder(cell_flat).unsqueeze(1)
@@ -684,13 +1023,21 @@ class StructureTransformer(nn.Module):
 
         for block in self.blocks:
             tokens = tokens + cell_condition
-            tokens = block(tokens, valid_mask, rotary_pe_cplx, rotary_position_ids)
+            tokens = block(
+                tokens,
+                valid_mask,
+                rotary_pe_cplx,
+                rotary_position_ids,
+                frac_pos_dense if self.use_periodic_rope else None,
+            )
 
         tokens = self.norm(tokens)
         cell_features = tokens[:, 0, :]
         atom_features = tokens[:, 1 : max_atoms + 1, :]
         if inverse_atom_index_order is not None:
-            atom_features = _gather_atom_features(atom_features, inverse_atom_index_order)
+            atom_features = _gather_atom_features(
+                atom_features, inverse_atom_index_order
+            )
 
         atom_energy = self.atom_energy_head(atom_features).squeeze(-1)
         atom_energy = atom_energy * output_atom_mask.to(dtype=atom_energy.dtype)

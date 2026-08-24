@@ -30,9 +30,30 @@ class ModelHypers(TypedDict):
     mlp_dropout: Optional[float] = None
     position_scale: float = 1.0
     position_representation: Literal["cartesian", "fractional"] = "cartesian"
+    coordinate_encoding: Literal["absolute_mlp", "v37_torus_relative"] = "absolute_mlp"
+    """Coordinate path: old absolute MLP or v37 relative torus features."""
+
+    coord_num_harmonics: int = 4
+    """Number of integer Fourier harmonics in the v37 coordinate encoder."""
+
     use_rotary_embeddings: bool = False
+    use_periodic_rope: bool = False
+    """If true, use v37 integer-harmonic fractional-coordinate RoPE."""
+
     atom_ordering: Literal["none", "position_ids", "permute"] = "none"
     center_positions: bool = True
+    fractional_wrap_eps: float = 1.0e-6
+    """Tolerance used when canonicalizing fractional coordinates near 0 and 1."""
+
+    atom_embedding_type: Literal["embedding", "scalar"] = "embedding"
+    """Atom encoder: embedding table or v37-style scalar Fourier embedding."""
+
+    atomic_number_scale: float = 118.0
+    """Scale applied before the scalar atomic-number Fourier embedding."""
+
+    atom_scalar_embedding_scale: float = 1000.0
+    """Frequency scale used by the scalar atomic-number Fourier embedding."""
+
     include_cell_energy: bool = True
     include_cell_stress: bool = True
     regress_forces: bool = True
