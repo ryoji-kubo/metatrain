@@ -180,6 +180,11 @@ class TrainerHypers(TypedDict):
     memory."""
     num_epochs: int = 1000
     """Number of epochs."""
+    use_data_augmentation: bool = True
+    """If true, apply random rotation/inversion augmentation to training batches.
+
+    Validation batches are never augmented.
+    """
     warmup_fraction: float = 0.01
     """Fraction of training steps used for learning rate warmup."""
     learning_rate: float = 1e-4

@@ -107,6 +107,16 @@ torchrun --standalone --nproc_per_node=4 \
   -r device=cuda \
   -r architecture.training.distributed=true \
   -r architecture.training.distributed_port=39591
+
+# 160k
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+torchrun --standalone --nproc_per_node=4 \
+  -m metatrain train options-structure-transformer-mptrj-salex-direct-160k-v37.yaml \
+  -o structure-transformer-mptrj-salex-ddp-160k-v37.pt \
+  -r device=cuda \
+  -r architecture.training.distributed=true \
+  -r architecture.training.distributed_port=39591 \
+  -r training_set.indices=indices/mptrj_160k_seed0.txt
 ```
 
 # Sending data

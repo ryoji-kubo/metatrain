@@ -259,11 +259,14 @@ I added `options-structure-transformer-mptrj-salex-direct-160k-v37.yaml` as a
 v37-style variant of `options-structure-transformer-mptrj-salex-direct-160k.yaml`.
 It keeps the same MPtrj/sAlex data, optimization schedule, target definitions,
 and model size, but changes the backbone settings that determine the symmetry
-behavior:
+behavior. It also sets `architecture.training.use_data_augmentation: false`, so
+training does not apply the PET random rotation/inversion augmenter:
 
 ```yaml
 architecture:
   name: experimental.structure_transformer
+  training:
+    use_data_augmentation: false
   model:
     position_representation: fractional
     coordinate_encoding: v37_torus_relative
@@ -290,6 +293,9 @@ The important differences from the starting config are:
   is handled by the transformer as a set order rather than as positional metadata.
 - `atom_embedding_type: scalar` matches the notebook's scalar Fourier encoding
   for atom numbers; the embedding-table path remains available through config.
+- `architecture.training.use_data_augmentation: false` removes
+  the PET `RotationalAugmenter` from the training path, disabling both random
+  rotations and random inversions.
 
 Run a single-process CUDA training job with:
 
@@ -297,6 +303,26 @@ Run a single-process CUDA training job with:
 /home/ryoji/miniconda3/envs/metatrain-pet/bin/python -m metatrain train \
   options-structure-transformer-mptrj-salex-direct-160k-v37.yaml \
   --output outputs/structure-transformer-metatrain-160k-v37/model.pt
+```
+
+Your current DDP command can be run as-is with this config because the YAML already
+sets `use_data_augmentation: false`:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+torchrun --standalone --nproc_per_node=4 \
+  -m metatrain train options-structure-transformer-mptrj-salex-direct-160k-v37.yaml \
+  -o structure-transformer-mptrj-salex-ddp-160k-v37.pt \
+  -r device=cuda \
+  -r architecture.training.distributed=true \
+  -r architecture.training.distributed_port=39591 \
+  -r training_set.indices=indices/mptrj_160k_seed0.txt
+```
+
+For any config that still has augmentation enabled, add this override:
+
+```bash
+-r architecture.training.use_data_augmentation=false
 ```
 
 Or, if `mtt` is on your active environment's `PATH`, the equivalent command is:

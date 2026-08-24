@@ -1,7 +1,9 @@
 import copy
+from pathlib import Path
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from metatrain.experimental.structure_transformer import StructureTransformerModel
 from metatrain.experimental.structure_transformer.modules.transformer import (
@@ -144,14 +146,20 @@ def test_v37_backbone_is_permutation_equivariant_for_atom_outputs():
 
 
 def test_v37_hyperparameters_are_exposed_to_config_and_wrapper():
-    hypers = copy.deepcopy(
-        get_default_hypers("experimental.structure_transformer")["model"]
-    )
+    defaults = get_default_hypers("experimental.structure_transformer")
+    hypers = copy.deepcopy(defaults["model"])
 
+    assert defaults["training"]["use_data_augmentation"] is True
     assert hypers["coordinate_encoding"] == "absolute_mlp"
     assert hypers["coord_num_harmonics"] == 4
     assert hypers["use_periodic_rope"] is False
     assert hypers["atom_embedding_type"] == "embedding"
+
+    repo_root = Path(__file__).parents[5]
+    v37_config = OmegaConf.load(
+        repo_root / "options-structure-transformer-mptrj-salex-direct-160k-v37.yaml"
+    )
+    assert v37_config.architecture.training.use_data_augmentation is False
 
     hypers.update(_v37_kwargs(num_layers=1))
     dataset_info = DatasetInfo(
