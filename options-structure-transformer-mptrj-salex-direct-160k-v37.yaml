@@ -2,7 +2,7 @@
 # This keeps the PET trainer/data pipeline and swaps only the neural architecture:
 # - fitted energy composition baseline
 # - fitted target scales for energy/force/stress
-# - random rotation/inversion augmentation
+# - optional random rotation/inversion augmentation, enabled in this v37 config
 # - same MPtrj training data and 30k sAlex validation data
 # - direct force/stress prediction, no conservative gradients
 
@@ -38,6 +38,8 @@ architecture:
     position_representation: fractional
     coordinate_encoding: v37_torus_relative
     coord_num_harmonics: 4
+    coord_encoder_chunk_size: 128
+    coord_encoder_use_checkpoint: true
     use_rotary_embeddings: false
     use_periodic_rope: true
     atom_ordering: none
@@ -56,10 +58,11 @@ architecture:
     symmetrize_stress: false
 
   training:
+    use_data_augmentation: true
     distributed: false
     distributed_port: 39591
 
-    batch_size: 16
+    batch_size: 4
     batch_atom_bounds: [null, null]
     max_atoms_per_batch: 512
     min_atoms_per_batch: 0

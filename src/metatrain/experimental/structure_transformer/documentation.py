@@ -36,6 +36,12 @@ class ModelHypers(TypedDict):
     coord_num_harmonics: int = 4
     """Number of integer Fourier harmonics in the v37 coordinate encoder."""
 
+    coord_encoder_chunk_size: Optional[int] = None
+    """Receiver-atom chunk size for the v37 all-pairs coordinate encoder."""
+
+    coord_encoder_use_checkpoint: bool = False
+    """If true, checkpoint v37 coordinate chunks to reduce training memory."""
+
     use_rotary_embeddings: bool = False
     use_periodic_rope: bool = False
     """If true, use v37 integer-harmonic fractional-coordinate RoPE."""

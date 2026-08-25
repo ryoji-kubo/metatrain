@@ -4,6 +4,7 @@ from typing import NamedTuple, Optional
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from .coordinate_utils import cartesian_to_fractional_dense
 
@@ -243,21 +244,72 @@ class TorusRelativeCoordEncoder(nn.Module):
         hidden_dim: int,
         num_harmonics: int = 4,
         wrap_eps: float = 1.0e-6,
+        chunk_size: Optional[int] = None,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         if num_harmonics < 1:
             raise ValueError("num_harmonics must be >= 1")
         if wrap_eps < 0.0:
             raise ValueError("wrap_eps must be non-negative")
+        if chunk_size is not None and chunk_size <= 0:
+            raise ValueError("chunk_size must be positive when provided")
         self.embed_dim = embed_dim
         self.num_harmonics = num_harmonics
         self.wrap_eps = wrap_eps
+        self.chunk_size = chunk_size
+        self.use_checkpoint = use_checkpoint
         periodic_feature_dim = 3 * 2 * num_harmonics
         self.pair_mlp = nn.Sequential(
             nn.Linear(periodic_feature_dim + embed_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, embed_dim),
         )
+
+    def _forward_receiver_chunk(
+        self,
+        u: torch.Tensor,
+        atom_features: torch.Tensor,
+        atom_mask: torch.Tensor,
+        start: int,
+        end: int,
+    ) -> torch.Tensor:
+        num_atoms = u.shape[1]
+        receiver_coords = u[:, start:end, :]
+        chunk_atoms = end - start
+        delta = receiver_coords.unsqueeze(2) - u.unsqueeze(1)
+        harmonics = torch.arange(
+            1,
+            self.num_harmonics + 1,
+            device=u.device,
+            dtype=u.dtype,
+        )
+        angles = 2.0 * math.pi * delta.unsqueeze(-1) * harmonics.view(
+            1, 1, 1, 1, -1
+        )
+        pair_features = torch.cat((angles.cos(), angles.sin()), dim=-1)
+        pair_features = pair_features.flatten(start_dim=-2)
+
+        neighbor_features = atom_features.to(dtype=pair_features.dtype).unsqueeze(1)
+        neighbor_features = neighbor_features.expand(-1, chunk_atoms, -1, -1)
+        pair_input = torch.cat((pair_features, neighbor_features), dim=-1)
+        messages = self.pair_mlp(pair_input)
+
+        receiver_mask = atom_mask[:, start:end]
+        valid_pair = receiver_mask.unsqueeze(2) & atom_mask.unsqueeze(1)
+        receiver_index = torch.arange(start, end, device=atom_mask.device)
+        neighbor_index = torch.arange(num_atoms, device=atom_mask.device)
+        self_pair = receiver_index.view(1, chunk_atoms, 1) == neighbor_index.view(
+            1, 1, num_atoms
+        )
+        valid_pair = valid_pair & ~self_pair
+        messages = messages.masked_fill(~valid_pair.unsqueeze(-1), 0.0)
+        denom = valid_pair.sum(dim=2).clamp_min(1).unsqueeze(-1)
+        coord_features = messages.sum(dim=2) / denom.to(dtype=messages.dtype)
+        coord_features = coord_features * receiver_mask.unsqueeze(-1).to(
+            dtype=coord_features.dtype
+        )
+        return coord_features.to(dtype=atom_features.dtype)
 
     def forward(
         self,
@@ -278,36 +330,41 @@ class TorusRelativeCoordEncoder(nn.Module):
         if num_atoms == 0:
             return atom_features.new_zeros((batch_size, 0, self.embed_dim))
 
-        out_dtype = atom_features.dtype
         u = _canonical_frac_coords(frac_coords.float(), self.wrap_eps)
-        delta = u.unsqueeze(2) - u.unsqueeze(1)
-        harmonics = torch.arange(
-            1,
-            self.num_harmonics + 1,
-            device=u.device,
-            dtype=u.dtype,
-        )
-        angles = 2.0 * math.pi * delta.unsqueeze(-1) * harmonics.view(
-            1, 1, 1, 1, -1
-        )
-        pair_features = torch.cat((angles.cos(), angles.sin()), dim=-1)
-        pair_features = pair_features.flatten(start_dim=-2)
+        chunk_size = num_atoms if self.chunk_size is None else self.chunk_size
+        chunks = []
+        for start in range(0, num_atoms, chunk_size):
+            end = min(start + chunk_size, num_atoms)
+            if self.use_checkpoint and self.training and atom_features.requires_grad:
 
-        neighbor_features = atom_features.to(dtype=pair_features.dtype).unsqueeze(1)
-        neighbor_features = neighbor_features.expand(-1, num_atoms, -1, -1)
-        pair_input = torch.cat((pair_features, neighbor_features), dim=-1)
-        messages = self.pair_mlp(pair_input)
+                def chunk_fn(
+                    u_: torch.Tensor,
+                    atom_features_: torch.Tensor,
+                    atom_mask_: torch.Tensor,
+                    chunk_start: int = start,
+                    chunk_end: int = end,
+                ) -> torch.Tensor:
+                    return self._forward_receiver_chunk(
+                        u_, atom_features_, atom_mask_, chunk_start, chunk_end
+                    )
 
-        valid_pair = atom_mask.unsqueeze(1) & atom_mask.unsqueeze(2)
-        self_mask = torch.eye(num_atoms, device=atom_mask.device, dtype=torch.bool)
-        valid_pair = valid_pair & ~self_mask.view(1, num_atoms, num_atoms)
-        messages = messages.masked_fill(~valid_pair.unsqueeze(-1), 0.0)
-        denom = valid_pair.sum(dim=2).clamp_min(1).unsqueeze(-1)
-        coord_features = messages.sum(dim=2) / denom.to(dtype=messages.dtype)
-        coord_features = coord_features * atom_mask.unsqueeze(-1).to(
-            dtype=coord_features.dtype
-        )
-        return coord_features.to(dtype=out_dtype)
+                chunk = activation_checkpoint(
+                    chunk_fn,
+                    u,
+                    atom_features,
+                    atom_mask,
+                    use_reentrant=False,
+                )
+            else:
+                chunk = self._forward_receiver_chunk(
+                    u,
+                    atom_features,
+                    atom_mask,
+                    start,
+                    end,
+                )
+            chunks.append(chunk)
+        return torch.cat(chunks, dim=1)
 
 
 def _atom_reordering(
@@ -547,6 +604,8 @@ class StructureTransformer(nn.Module):
         position_representation: str = "cartesian",
         coordinate_encoding: str = "absolute_mlp",
         coord_num_harmonics: int = 4,
+        coord_encoder_chunk_size: Optional[int] = None,
+        coord_encoder_use_checkpoint: bool = False,
         use_rotary_embeddings: bool = False,
         use_periodic_rope: bool = False,
         atom_ordering: str = "none",
@@ -615,6 +674,8 @@ class StructureTransformer(nn.Module):
             )
         if coord_num_harmonics < 1:
             raise ValueError("coord_num_harmonics must be >= 1")
+        if coord_encoder_chunk_size is not None and coord_encoder_chunk_size <= 0:
+            raise ValueError("coord_encoder_chunk_size must be positive when provided")
         if fractional_wrap_eps < 0.0:
             raise ValueError("fractional_wrap_eps must be non-negative")
         if atom_embedding_type == "scalar" and embed_dim % 2 != 0:
@@ -639,6 +700,8 @@ class StructureTransformer(nn.Module):
         self.position_representation = position_representation
         self.coordinate_encoding = coordinate_encoding
         self.coord_num_harmonics = coord_num_harmonics
+        self.coord_encoder_chunk_size = coord_encoder_chunk_size
+        self.coord_encoder_use_checkpoint = coord_encoder_use_checkpoint
         self.use_rotary_embeddings = use_rotary_embeddings
         self.use_periodic_rope = use_periodic_rope
         self.atom_ordering = atom_ordering
@@ -684,6 +747,8 @@ class StructureTransformer(nn.Module):
                 hidden_dim=encoder_hidden_dim,
                 num_harmonics=coord_num_harmonics,
                 wrap_eps=self.fractional_wrap_eps,
+                chunk_size=coord_encoder_chunk_size,
+                use_checkpoint=coord_encoder_use_checkpoint,
             )
         else:
             self.position_encoder = _build_mlp(

@@ -271,6 +271,8 @@ architecture:
     position_representation: fractional
     coordinate_encoding: v37_torus_relative
     coord_num_harmonics: 4
+    coord_encoder_chunk_size: 32
+    coord_encoder_use_checkpoint: true
     use_rotary_embeddings: false
     use_periodic_rope: true
     atom_ordering: none
@@ -293,9 +295,308 @@ The important differences from the starting config are:
   is handled by the transformer as a set order rather than as positional metadata.
 - `atom_embedding_type: scalar` matches the notebook's scalar Fourier encoding
   for atom numbers; the embedding-table path remains available through config.
+- `coord_encoder_chunk_size: 32` and `coord_encoder_use_checkpoint: true`
+  reduce the training memory of the v37 all-pairs coordinate encoder without
+  removing large structures from the dataset.
 - `architecture.training.use_data_augmentation: false` removes
   the PET `RotationalAugmenter` from the training path, disabling both random
   rotations and random inversions.
+
+### Memory and Large MPtrj Structures
+
+The MPtrj EDA notebook at
+`/home/ryoji/equiformer_v3/experimental/datasets/mptrj_metadata_eda.ipynb`
+shows that the 160k split has a long atom-count tail: maximum 444 atoms,
+99th percentile 144 atoms, and 99.9th percentile 216 atoms. A hard cutoff such
+as `max_atoms_per_batch=128` would therefore remove meaningful large-cell
+training examples.
+
+The v37 memory issue comes from `TorusRelativeCoordEncoder.forward`, not from the
+parameter count. For a padded batch with `B` structures and `N_max` atoms, the
+full receiver-neighbor coordinate encoder forms all-pairs features
+
+```math
+\Delta u_{b i j}=\operatorname{wrap}(u_{b i}-u_{b j})\in\mathbb{T}^3,
+```
+
+then evaluates
+
+```math
+ h_{b i j}=\operatorname{MLP}\left([
+    \phi(\Delta u_{b i j}), z_{b j}
+ ]\right)\in\mathbb{R}^{D},
+```
+
+where the hidden layer inside that MLP has width `H = encoder_hidden_dim`. The
+large saved activation has scale
+
+```math
+\Theta(B N_{\max}^{2} H).
+```
+
+This is why v37 can OOM even when a larger parameter-count model fits: v37 adds a
+wide all-pairs pair MLP before the transformer blocks.
+
+To keep the large structures, `TorusRelativeCoordEncoder.forward` now chunks over
+receiver atoms:
+
+```python
+for start in range(0, num_atoms, chunk_size):
+    end = min(start + chunk_size, num_atoms)
+    chunk = self._forward_receiver_chunk(u, atom_features, atom_mask, start, end)
+```
+
+For chunk size `C`, the largest per-chunk pair hidden tensor is
+
+```math
+H_{\mathrm{chunk}}\in\mathbb{R}^{B\times C\times N_{\max}\times H},
+```
+
+so the pair-MLP peak memory changes from approximately
+
+```math
+B N_{\max}^{2} H \quad\text{to}\quad B C N_{\max} H.
+```
+
+The arithmetic is still all-pairs, `\Theta(BN_{\max}^{2})`, but the peak memory
+is smaller by roughly
+
+```math
+\frac{C}{N_{\max}}.
+```
+
+With `coord_encoder_chunk_size: 32` and a 400-atom structure, that pair-hidden
+peak is about `32 / 400 = 0.08` of the unchunked receiver dimension. The config
+also sets `coord_encoder_use_checkpoint: true`, which routes each receiver chunk
+through
+
+```python
+activation_checkpoint(chunk_fn, u, atom_features, atom_mask, use_reentrant=False)
+```
+
+During training, checkpointing avoids storing the chunk's internal pair-MLP
+activations and recomputes them during backward. This trades extra compute for a
+much lower backward memory footprint, which is the right tradeoff before cutting
+large MPtrj structures.
+
+If this still OOMs, the next knobs to try are lower chunk sizes before lowering
+atom coverage:
+
+```bash
+-r architecture.model.coord_encoder_chunk_size=16 \
+-r architecture.model.coord_encoder_use_checkpoint=true
+```
+
+PyTorch allocator fragmentation can also be reduced with:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+
+### What Changed for the OOM Fix
+
+The fix is an exact refactor of the v37 coordinate encoder computation, plus two
+new hyperparameters that expose the memory behavior in config:
+
+```python
+coord_encoder_chunk_size: Optional[int] = None
+coord_encoder_use_checkpoint: bool = False
+```
+
+These are accepted by `StructureTransformer.__init__`, validated as positive
+when present, stored on the model, and passed into `TorusRelativeCoordEncoder`:
+
+```python
+self.position_encoder = TorusRelativeCoordEncoder(
+    embed_dim=embed_dim,
+    hidden_dim=encoder_hidden_dim,
+    num_harmonics=coord_num_harmonics,
+    wrap_eps=self.fractional_wrap_eps,
+    chunk_size=coord_encoder_chunk_size,
+    use_checkpoint=coord_encoder_use_checkpoint,
+)
+```
+
+Inside `TorusRelativeCoordEncoder`, I split the original all-receiver computation
+into `_forward_receiver_chunk`. For a receiver slice
+
+```math
+I_s=\{s,s+1,\ldots,e-1\},\quad |I_s|=C_s,
+```
+
+that function computes only the pair tensor whose receiver index is in `I_s`:
+
+```python
+receiver_coords = u[:, start:end, :]
+delta = receiver_coords.unsqueeze(2) - u.unsqueeze(1)
+```
+
+Mathematically, this is the restricted pair-difference tensor
+
+```math
+\Delta u^{(s)}_{b i j}=u_{b i}-u_{b j},
+\quad i\in I_s,
+\quad j\in\{1,\ldots,N_{\max}\}.
+```
+
+The rest of the per-pair computation is unchanged. The same Fourier features are
+built, the same pair MLP is applied, masked self-pairs and padding are removed,
+and neighbor messages are averaged:
+
+```python
+pair_features = torch.cat((angles.cos(), angles.sin()), dim=-1)
+pair_input = torch.cat((pair_features, neighbor_features), dim=-1)
+messages = self.pair_mlp(pair_input)
+coord_features = messages.sum(dim=2) / denom.to(dtype=messages.dtype)
+```
+
+So the chunked output is exactly the concatenation of the same per-receiver
+features the unchunked encoder would have produced:
+
+```math
+Z_{\mathrm{coord}}
+=\operatorname{concat}_{s}
+  \left(
+    \frac{1}{|\mathcal{N}_i|}
+    \sum_{j\in\mathcal{N}_i}
+    \operatorname{MLP}([
+      \phi(u_i-u_j), z_j
+    ])
+  \right)_{i\in I_s}.
+```
+
+The main `forward` method now loops over receiver chunks:
+
+```python
+chunk_size = num_atoms if self.chunk_size is None else self.chunk_size
+chunks = []
+for start in range(0, num_atoms, chunk_size):
+    end = min(start + chunk_size, num_atoms)
+    chunk = self._forward_receiver_chunk(u, atom_features, atom_mask, start, end)
+    chunks.append(chunk)
+return torch.cat(chunks, dim=1)
+```
+
+When `coord_encoder_use_checkpoint: true`, training calls the chunk through
+`torch.utils.checkpoint`. The defaults `chunk_start=start` and `chunk_end=end`
+are intentionally bound in the nested function so backward replays the same
+slice that was used in forward:
+
+```python
+def chunk_fn(
+    u_: torch.Tensor,
+    atom_features_: torch.Tensor,
+    atom_mask_: torch.Tensor,
+    chunk_start: int = start,
+    chunk_end: int = end,
+) -> torch.Tensor:
+    return self._forward_receiver_chunk(
+        u_, atom_features_, atom_mask_, chunk_start, chunk_end
+    )
+
+chunk = activation_checkpoint(
+    chunk_fn,
+    u,
+    atom_features,
+    atom_mask,
+    use_reentrant=False,
+)
+```
+
+The v37 YAML enables this path with:
+
+```yaml
+coord_encoder_chunk_size: 32
+coord_encoder_use_checkpoint: true
+```
+
+Let
+
+```math
+B=\text{number of structures in the dense batch},\quad
+N=N_{\max},\quad
+C=\text{receiver chunk size},
+```
+
+```math
+D=\texttt{embed\_dim},\quad
+H=\texttt{encoder\_hidden\_dim},\quad
+M=\texttt{coord\_num\_harmonics}.
+```
+
+The per-pair Fourier feature width is
+
+```math
+F_{\phi}=3\times 2M=6M,
+```
+
+because each of the three fractional coordinates gets `cos` and `sin` features
+for `M` integer harmonics. The pair MLP receives width `F_phi + D`, expands to
+`H`, and returns width `D`:
+
+```math
+\mathbb{R}^{6M+D}\rightarrow\mathbb{R}^{H}\rightarrow\mathbb{R}^{D}.
+```
+
+The total coordinate-encoder arithmetic is still all-pairs:
+
+```math
+T_{\mathrm{coord}}
+=\Theta\left(
+  B N^2\left[M+(6M+D)H+HD+D\right]
+\right).
+```
+
+Chunking does not change this asymptotic compute; it changes the largest tensor
+that must exist at once. Without chunking, the hidden pair activation is shaped
+approximately
+
+```math
+B\times N\times N\times H.
+```
+
+With receiver chunks, the largest hidden pair activation is only
+
+```math
+B\times C\times N\times H.
+```
+
+So the coordinate-encoder peak activation memory drops from roughly
+
+```math
+S_{\mathrm{full}}=\Theta(BN^2(H+D+6M))
+```
+
+to the per-chunk peak
+
+```math
+S_{\mathrm{chunk}}=\Theta(BCN(H+D+6M))+\Theta(BND).
+```
+
+The `\Theta(BND)` term is the final per-atom coordinate feature output that must
+still be kept for the transformer. Without checkpointing, autograd may still
+retain many chunk internals for backward, so chunking alone mostly reduces
+transient peak allocation. With checkpointing, those internals are not stored;
+they are recomputed during backward. The training compute becomes approximately
+
+```math
+T_{\mathrm{train,ckpt}}
+\approx T_{\mathrm{train,no\ ckpt}}+T_{\mathrm{coord\ forward}},
+```
+
+which is a deliberate compute-for-memory tradeoff.
+
+This refactor preserves the v37 symmetries because it does not introduce any
+receiver-index feature or order-dependent reduction. It only partitions the same
+set of receiver atoms into temporary slices:
+
+```math
+\operatorname{concat}_{s} f_{I_s}(A,U,L)=f(A,U,L).
+```
+
+The regression tests now check both sides of that claim: chunked and unchunked
+models with identical weights produce the same outputs, and checkpointed chunks
+can backpropagate through `position_encoder.pair_mlp`.
 
 Run a single-process CUDA training job with:
 
@@ -361,6 +662,9 @@ checks:
 2. a common real fractional translation leaves energy, stress, and forces
    unchanged;
 3. atom permutation leaves energy and stress unchanged and permutes forces;
-4. the new hyperparameters appear in `get_default_hypers` and pass through
+4. chunked v37 coordinate encoding matches the unchunked encoder output;
+5. checkpointed coordinate chunks support backpropagation;
+6. the new hyperparameters appear in `get_default_hypers` and pass through
    `StructureTransformerModel`;
-5. invalid v37 combinations, such as index ordering or double RoPE, are rejected.
+7. invalid v37 combinations, such as index ordering, double RoPE, or nonpositive
+   coordinate chunk sizes, are rejected.
