@@ -1,14 +1,15 @@
-# Experimental metatrain wrapper for the equiformer_v3 direct transformer.
-# This keeps the PET trainer/data pipeline and swaps only the neural architecture:
-# - fitted energy composition baseline
-# - fitted target scales for energy/force/stress
-# - random rotation/inversion augmentation disabled for the v37 invariance run
-# - same MPtrj training data and 30k sAlex validation data
-# - direct force/stress prediction, no conservative gradients
+# L-sized, current-schema PET-OAM-like training on full prepared MPtrj, with
+# validation on the prepared 30k sAlex split.
+#
+# This variant uses direct force/stress prediction only:
+# - energy is trained as a scalar target
+# - force is trained through the direct non_conservative_force head
+# - stress is trained through the direct non_conservative_stress head
+# - energy gradients are not requested, so conservative force/stress losses are off
 
 wandb:
   project: pet-oam-mptrj
-  name: structure-transformer-metatrain-160k-v37
+  name: pet-oam-l-epoch@50
   entity: null
   mode: online
 
@@ -17,55 +18,46 @@ device: cuda
 base_precision: 32
 
 architecture:
-  name: experimental.structure_transformer
-
+  name: pet
 
   model:
-    # v37-style invariant backbone: relative torus coordinate features,
-    # integer-harmonic coordinate RoPE, and no sequence-index atom ordering.
-    max_num_elements: 128
-    embed_dim: 768
-    num_heads: 12
-    num_layers: 12
-    encoder_hidden_dim: null
-    mlp_hidden_dim: null
-    dropout: 0.05
-    attn_dropout: null
-    residual_dropout: null
-    mlp_dropout: null
+    cutoff: 10.0
+    num_neighbors_adaptive: 40
+    adaptive_cutoff_method: grid
+    cutoff_function: Bump
+    cutoff_width: 0.5
 
-    position_scale: 1.0
-    position_representation: fractional
-    coordinate_encoding: v37_torus_relative
-    coord_num_harmonics: 4
-    use_rotary_embeddings: false
-    use_periodic_rope: true
-    atom_ordering: none
-    center_positions: false
-    fractional_wrap_eps: 1.0e-6
-    atom_embedding_type: scalar
-    atomic_number_scale: 118.0
-    atom_scalar_embedding_scale: 1000.0
-    include_cell_energy: true
-    include_cell_stress: true
+    d_pet: 512
+    d_head: 512
+    d_node: 2048
+    d_feedforward: 1024
+    num_heads: 8
+    num_attention_layers: 2
+    num_gnn_layers: 3
 
-    regress_forces: true
-    regress_stress: true
-    direct_prediction: true
-    avg_num_nodes: 1.0
-    symmetrize_stress: false
+    normalization: RMSNorm
+    activation: SwiGLU
+    attention_temperature: 1.0
+    transformer_type: PreLN
+    featurizer_type: feedforward
+    zbl: false
+    long_range:
+      enable: false
+      use_ewald: false
+      smearing: 1.4
+      kspace_resolution: 1.33
+      interpolation_nodes: 5
 
   training:
     distributed: false
     distributed_port: 39591
 
-    batch_size: 4
+    batch_size: 16
     batch_atom_bounds: [null, null]
     max_atoms_per_batch: 512
     min_atoms_per_batch: 0
 
-    num_epochs: 100
-    use_data_augmentation: false
+    num_epochs: 50
     warmup_fraction: 0.1
     learning_rate: 1.0e-4
     weight_decay: null

@@ -2,13 +2,13 @@
 # This keeps the PET trainer/data pipeline and swaps only the neural architecture:
 # - fitted energy composition baseline
 # - fitted target scales for energy/force/stress
-# - random rotation/inversion augmentation disabled for the v37 invariance run
+# - random rotation/inversion augmentation
 # - same MPtrj training data and 30k sAlex validation data
 # - direct force/stress prediction, no conservative gradients
 
 wandb:
   project: pet-oam-mptrj
-  name: structure-transformer-metatrain-160k-v37
+  name: structure-transformer-metatrain-cartesian-160k
   entity: null
   mode: online
 
@@ -21,8 +21,7 @@ architecture:
 
 
   model:
-    # v37-style invariant backbone: relative torus coordinate features,
-    # integer-harmonic coordinate RoPE, and no sequence-index atom ordering.
+    # Mirrors the equiformer_v3 experimental transformer config as closely as possible.
     max_num_elements: 128
     embed_dim: 768
     num_heads: 12
@@ -35,17 +34,10 @@ architecture:
     mlp_dropout: null
 
     position_scale: 1.0
-    position_representation: fractional
-    coordinate_encoding: v37_torus_relative
-    coord_num_harmonics: 4
-    use_rotary_embeddings: false
-    use_periodic_rope: true
-    atom_ordering: none
+    position_representation: cartesian
+    use_rotary_embeddings: true
+    atom_ordering: position_ids
     center_positions: false
-    fractional_wrap_eps: 1.0e-6
-    atom_embedding_type: scalar
-    atomic_number_scale: 118.0
-    atom_scalar_embedding_scale: 1000.0
     include_cell_energy: true
     include_cell_stress: true
 
@@ -59,13 +51,12 @@ architecture:
     distributed: false
     distributed_port: 39591
 
-    batch_size: 4
+    batch_size: 16
     batch_atom_bounds: [null, null]
     max_atoms_per_batch: 512
     min_atoms_per_batch: 0
 
     num_epochs: 100
-    use_data_augmentation: false
     warmup_fraction: 0.1
     learning_rate: 1.0e-4
     weight_decay: null
