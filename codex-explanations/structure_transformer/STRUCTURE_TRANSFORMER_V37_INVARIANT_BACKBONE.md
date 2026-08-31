@@ -622,7 +622,7 @@ pair_readout_num_heads: null
 pair_readout_hidden_dim: null
 pair_readout_num_layers: 1
 pair_readout_dropout: null
-pair_readout_chunk_size: 64
+pair_readout_chunk_size: null
 pair_readout_use_checkpoint: false
 pair_readout_include_pair_geometry: false
 pair_readout_exclude_self: true
