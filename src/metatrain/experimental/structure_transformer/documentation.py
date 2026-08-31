@@ -79,6 +79,36 @@ class ModelHypers(TypedDict):
     edge_vector_head_replace_direct: bool = False
     """If true, use only the edge-vector head for force and stress outputs."""
 
+    force_readout_type: Literal["mlp", "pair_cross_attention"] = "mlp"
+    """Prediction head used before the final force vector projection."""
+
+    stress_readout_type: Literal["mlp", "pair_cross_attention"] = "mlp"
+    """Prediction head used before the final per-atom stress projection."""
+
+    pair_readout_num_heads: Optional[int] = None
+    """Attention heads for pair_cross_attention readouts; defaults to num_heads."""
+
+    pair_readout_hidden_dim: Optional[int] = None
+    """SwiGLU hidden width for pair_cross_attention readouts."""
+
+    pair_readout_num_layers: int = 1
+    """Number of receiver-wise cross-attention layers in each enabled readout."""
+
+    pair_readout_dropout: Optional[float] = None
+    """Dropout inside pair_cross_attention readouts; defaults to dropout."""
+
+    pair_readout_chunk_size: Optional[int] = None
+    """Receiver-atom chunk size for pair_cross_attention readouts."""
+
+    pair_readout_use_checkpoint: bool = False
+    """If true, checkpoint pair_cross_attention readout chunks during training."""
+
+    pair_readout_include_pair_geometry: bool = False
+    """If true, add periodic Fourier pair-geometry bias to readout attention."""
+
+    pair_readout_exclude_self: bool = True
+    """If true, atom readout attention masks self-pairs when other atoms exist."""
+
     direct_prediction: bool = True
     avg_num_nodes: float = 1.0
     symmetrize_stress: bool = False

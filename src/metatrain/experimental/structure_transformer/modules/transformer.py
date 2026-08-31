@@ -578,6 +578,274 @@ class TransformerBlock(nn.Module):
         return x * valid_mask.unsqueeze(-1).to(dtype=x.dtype)
 
 
+class PairCrossAttentionReadoutLayer(nn.Module):
+    """Receiver-wise cross-attention readout over fixed atom latents."""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        mlp_hidden_dim: Optional[int],
+        dropout: float,
+        num_harmonics: int,
+        fractional_wrap_eps: float,
+        include_pair_geometry: bool,
+        exclude_self: bool,
+    ):
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError("embed_dim must be divisible by pair readout heads")
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.num_harmonics = num_harmonics
+        self.fractional_wrap_eps = fractional_wrap_eps
+        self.include_pair_geometry = include_pair_geometry
+        self.exclude_self = exclude_self
+        self.scale = self.head_dim**-0.5
+
+        self.query_norm = RMSNorm(embed_dim)
+        self.key_value_norm = RMSNorm(embed_dim)
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.attn_drop = nn.Dropout(dropout)
+        self.out_drop = nn.Dropout(dropout)
+        self.mlp_norm = RMSNorm(embed_dim)
+        self.mlp = SwiGLU(embed_dim, mlp_hidden_dim)
+        self.mlp_drop = nn.Dropout(dropout)
+        if self.include_pair_geometry:
+            self.pair_bias = nn.Linear(6 * num_harmonics, num_heads, bias=False)
+        else:
+            self.pair_bias = None
+
+    def _pair_geometry_bias(
+        self,
+        receiver_frac: torch.Tensor,
+        source_frac: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.pair_bias is None:
+            raise RuntimeError("pair geometry bias was not initialized")
+        delta = receiver_frac.unsqueeze(2) - source_frac.unsqueeze(1)
+        harmonics = torch.arange(
+            1,
+            self.num_harmonics + 1,
+            device=delta.device,
+            dtype=delta.dtype,
+        )
+        angles = 2.0 * math.pi * delta.unsqueeze(-1) * harmonics.view(
+            1, 1, 1, 1, -1
+        )
+        pair_features = torch.cat((angles.cos(), angles.sin()), dim=-1)
+        pair_features = pair_features.flatten(start_dim=-2)
+        pair_features = pair_features.to(dtype=self.pair_bias.weight.dtype)
+        return self.pair_bias(pair_features).permute(0, 3, 1, 2).float()
+
+    def forward(
+        self,
+        receiver_state: torch.Tensor,
+        source_state: torch.Tensor,
+        receiver_mask: torch.Tensor,
+        source_mask: torch.Tensor,
+        frac_coords: Optional[torch.Tensor],
+        start: int,
+    ) -> torch.Tensor:
+        batch_size, num_receivers, embed_dim = receiver_state.shape
+        num_sources = source_state.shape[1]
+        if num_receivers == 0 or num_sources == 0:
+            return receiver_state
+
+        query_state = self.query_norm(receiver_state)
+        source_state = self.key_value_norm(source_state)
+        q = self.q_proj(query_state).view(
+            batch_size, num_receivers, self.num_heads, self.head_dim
+        )
+        k = self.k_proj(source_state).view(
+            batch_size, num_sources, self.num_heads, self.head_dim
+        )
+        v = self.v_proj(source_state).view(
+            batch_size, num_sources, self.num_heads, self.head_dim
+        )
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        attn_logits = torch.matmul(q.float(), k.float().transpose(-2, -1))
+        attn_logits = attn_logits * self.scale
+        if self.include_pair_geometry:
+            if frac_coords is None:
+                raise ValueError(
+                    "frac_coords are required when pair_readout_include_pair_geometry=True"
+                )
+            frac_coords = _canonical_frac_coords(
+                frac_coords.float(),
+                self.fractional_wrap_eps,
+            )
+            receiver_frac = frac_coords[:, start : start + num_receivers, :]
+            attn_logits = attn_logits + self._pair_geometry_bias(
+                receiver_frac,
+                frac_coords,
+            )
+
+        valid_pair = receiver_mask.unsqueeze(2) & source_mask.unsqueeze(1)
+        if self.exclude_self:
+            receiver_index = torch.arange(
+                start,
+                start + num_receivers,
+                device=source_mask.device,
+            )
+            source_index = torch.arange(num_sources, device=source_mask.device)
+            self_pair = receiver_index.view(1, num_receivers, 1) == source_index.view(
+                1, 1, num_sources
+            )
+            non_self_pair = valid_pair & ~self_pair
+            valid_pair = torch.where(
+                non_self_pair.any(dim=2, keepdim=True),
+                non_self_pair,
+                valid_pair,
+            )
+
+        fallback_pair = torch.zeros_like(valid_pair)
+        fallback_pair[:, :, 0] = True
+        valid_pair = torch.where(
+            valid_pair.any(dim=2, keepdim=True),
+            valid_pair,
+            fallback_pair,
+        )
+        attn_logits = attn_logits.masked_fill(
+            ~valid_pair.unsqueeze(1),
+            torch.finfo(attn_logits.dtype).min,
+        )
+        attn = F.softmax(attn_logits, dim=-1).to(dtype=v.dtype)
+        attn = attn.masked_fill(~valid_pair.unsqueeze(1), 0.0)
+        attn = self.attn_drop(attn)
+
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(
+            batch_size,
+            num_receivers,
+            embed_dim,
+        )
+        x = receiver_state + self.out_drop(self.out_proj(out))
+        x = x + self.mlp_drop(self.mlp(self.mlp_norm(x)))
+        return x * receiver_mask.unsqueeze(-1).to(dtype=x.dtype)
+
+
+class PairCrossAttentionReadout(nn.Module):
+    """Atom-wise prediction-head transformer using cross-attention to all atoms."""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        num_layers: int,
+        mlp_hidden_dim: Optional[int],
+        dropout: float,
+        num_harmonics: int,
+        fractional_wrap_eps: float,
+        chunk_size: Optional[int] = None,
+        use_checkpoint: bool = False,
+        include_pair_geometry: bool = False,
+        exclude_self: bool = True,
+    ):
+        super().__init__()
+        if num_layers < 1:
+            raise ValueError("pair_readout_num_layers must be >= 1")
+        if chunk_size is not None and chunk_size <= 0:
+            raise ValueError("pair_readout_chunk_size must be positive when provided")
+        self.embed_dim = embed_dim
+        self.chunk_size = chunk_size
+        self.use_checkpoint = use_checkpoint
+        self.include_pair_geometry = include_pair_geometry
+        self.layers = nn.ModuleList(
+            [
+                PairCrossAttentionReadoutLayer(
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_hidden_dim=mlp_hidden_dim,
+                    dropout=dropout,
+                    num_harmonics=num_harmonics,
+                    fractional_wrap_eps=fractional_wrap_eps,
+                    include_pair_geometry=include_pair_geometry,
+                    exclude_self=exclude_self,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+    def forward(
+        self,
+        atom_features: torch.Tensor,
+        frac_coords: torch.Tensor,
+        atom_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if atom_features.ndim != 3:
+            raise ValueError("atom_features must have shape [B, N, D]")
+        if atom_features.shape[-1] != self.embed_dim:
+            raise ValueError("atom_features has the wrong embedding dimension")
+        if atom_mask.shape != atom_features.shape[:2]:
+            raise ValueError("atom_mask must have shape [B, N]")
+        expected_frac_shape = (*atom_features.shape[:2], 3)
+        if self.include_pair_geometry and frac_coords.shape != expected_frac_shape:
+            raise ValueError("frac_coords must have shape [B, N, 3]")
+
+        batch_size, num_atoms, _ = atom_features.shape
+        if num_atoms == 0:
+            return atom_features.new_zeros((batch_size, 0, self.embed_dim))
+
+        source_state = atom_features * atom_mask.unsqueeze(-1).to(
+            dtype=atom_features.dtype
+        )
+        state = source_state
+        chunk_size = num_atoms if self.chunk_size is None else self.chunk_size
+        for layer in self.layers:
+            chunks = []
+            for start in range(0, num_atoms, chunk_size):
+                end = min(start + chunk_size, num_atoms)
+                receiver_state = state[:, start:end, :]
+                if self.use_checkpoint and self.training and state.requires_grad:
+
+                    def chunk_fn(
+                        receiver_state_: torch.Tensor,
+                        source_state_: torch.Tensor,
+                        atom_mask_: torch.Tensor,
+                        frac_coords_: torch.Tensor,
+                        chunk_start: int = start,
+                        chunk_end: int = end,
+                        layer_: PairCrossAttentionReadoutLayer = layer,
+                    ) -> torch.Tensor:
+                        return layer_(
+                            receiver_state_,
+                            source_state_,
+                            atom_mask_[:, chunk_start:chunk_end],
+                            atom_mask_,
+                            frac_coords_,
+                            chunk_start,
+                        )
+
+                    chunk = activation_checkpoint(
+                        chunk_fn,
+                        receiver_state,
+                        source_state,
+                        atom_mask,
+                        frac_coords,
+                        use_reentrant=False,
+                    )
+                else:
+                    chunk = layer(
+                        receiver_state,
+                        source_state,
+                        atom_mask[:, start:end],
+                        atom_mask,
+                        frac_coords,
+                        start,
+                    )
+                chunks.append(chunk)
+            state = torch.cat(chunks, dim=1)
+        return state
+
+
 class StructureTransformer(nn.Module):
     """
     LLaMA-style direct predictor for structures, copied from the local equiformer_v3
@@ -623,6 +891,16 @@ class StructureTransformer(nn.Module):
         edge_vector_head_hidden_dim: int = 256,
         edge_vector_head_num_radial_basis: int = 16,
         edge_vector_head_replace_direct: bool = False,
+        force_readout_type: str = "mlp",
+        stress_readout_type: str = "mlp",
+        pair_readout_num_heads: Optional[int] = None,
+        pair_readout_hidden_dim: Optional[int] = None,
+        pair_readout_num_layers: int = 1,
+        pair_readout_dropout: Optional[float] = None,
+        pair_readout_chunk_size: Optional[int] = None,
+        pair_readout_use_checkpoint: bool = False,
+        pair_readout_include_pair_geometry: bool = False,
+        pair_readout_exclude_self: bool = True,
         direct_prediction: bool = True,
         avg_num_nodes: float = 1.0,
         d: Optional[int] = None,
@@ -691,6 +969,25 @@ class StructureTransformer(nn.Module):
                 raise ValueError("edge_vector_head_hidden_dim must be positive")
             if edge_vector_head_num_radial_basis <= 0:
                 raise ValueError("edge_vector_head_num_radial_basis must be positive")
+        valid_readout_types = {"mlp", "pair_cross_attention"}
+        if force_readout_type not in valid_readout_types:
+            raise ValueError(
+                "force_readout_type must be one of "
+                f"{sorted(valid_readout_types)}, got {force_readout_type!r}"
+            )
+        if stress_readout_type not in valid_readout_types:
+            raise ValueError(
+                "stress_readout_type must be one of "
+                f"{sorted(valid_readout_types)}, got {stress_readout_type!r}"
+            )
+        if pair_readout_num_heads is not None and pair_readout_num_heads <= 0:
+            raise ValueError("pair_readout_num_heads must be positive when provided")
+        if pair_readout_hidden_dim is not None and pair_readout_hidden_dim <= 0:
+            raise ValueError("pair_readout_hidden_dim must be positive when provided")
+        if pair_readout_num_layers < 1:
+            raise ValueError("pair_readout_num_layers must be >= 1")
+        if pair_readout_chunk_size is not None and pair_readout_chunk_size <= 0:
+            raise ValueError("pair_readout_chunk_size must be positive when provided")
 
         self.max_num_elements = max_num_elements
         self.embed_dim = embed_dim
@@ -729,6 +1026,27 @@ class StructureTransformer(nn.Module):
             residual_dropout = dropout
         if mlp_dropout is None:
             mlp_dropout = dropout
+        if pair_readout_num_heads is None:
+            pair_readout_num_heads = num_heads
+        if pair_readout_hidden_dim is None:
+            pair_readout_hidden_dim = encoder_hidden_dim
+        if pair_readout_dropout is None:
+            pair_readout_dropout = dropout
+        if embed_dim % pair_readout_num_heads != 0:
+            raise ValueError(
+                "embed_dim must be divisible by pair_readout_num_heads"
+            )
+
+        self.force_readout_type = force_readout_type
+        self.stress_readout_type = stress_readout_type
+        self.pair_readout_num_heads = pair_readout_num_heads
+        self.pair_readout_hidden_dim = pair_readout_hidden_dim
+        self.pair_readout_num_layers = pair_readout_num_layers
+        self.pair_readout_dropout = float(pair_readout_dropout)
+        self.pair_readout_chunk_size = pair_readout_chunk_size
+        self.pair_readout_use_checkpoint = pair_readout_use_checkpoint
+        self.pair_readout_include_pair_geometry = pair_readout_include_pair_geometry
+        self.pair_readout_exclude_self = pair_readout_exclude_self
 
         if self.atom_embedding_type == "embedding":
             self.atom_embedding = nn.Embedding(
@@ -776,6 +1094,35 @@ class StructureTransformer(nn.Module):
             ]
         )
         self.norm = RMSNorm(embed_dim)
+
+        if self.regress_forces and self.force_readout_type == "pair_cross_attention":
+            self.force_pair_readout = PairCrossAttentionReadout(
+                embed_dim=embed_dim,
+                num_heads=pair_readout_num_heads,
+                num_layers=pair_readout_num_layers,
+                mlp_hidden_dim=pair_readout_hidden_dim,
+                dropout=pair_readout_dropout,
+                num_harmonics=coord_num_harmonics,
+                fractional_wrap_eps=self.fractional_wrap_eps,
+                chunk_size=pair_readout_chunk_size,
+                use_checkpoint=pair_readout_use_checkpoint,
+                include_pair_geometry=pair_readout_include_pair_geometry,
+                exclude_self=pair_readout_exclude_self,
+            )
+        if self.regress_stress and self.stress_readout_type == "pair_cross_attention":
+            self.stress_pair_readout = PairCrossAttentionReadout(
+                embed_dim=embed_dim,
+                num_heads=pair_readout_num_heads,
+                num_layers=pair_readout_num_layers,
+                mlp_hidden_dim=pair_readout_hidden_dim,
+                dropout=pair_readout_dropout,
+                num_harmonics=coord_num_harmonics,
+                fractional_wrap_eps=self.fractional_wrap_eps,
+                chunk_size=pair_readout_chunk_size,
+                use_checkpoint=pair_readout_use_checkpoint,
+                include_pair_geometry=pair_readout_include_pair_geometry,
+                exclude_self=pair_readout_exclude_self,
+            )
 
         self.atom_energy_head = _build_mlp(embed_dim, encoder_hidden_dim, 1, dropout)
         self.cell_energy_head = _build_mlp(embed_dim, encoder_hidden_dim, 1, dropout)
@@ -974,6 +1321,7 @@ class StructureTransformer(nn.Module):
             or self.atom_ordering != "none"
             or self.coordinate_encoding == "v37_torus_relative"
             or self.use_periodic_rope
+            or self.pair_readout_include_pair_geometry
         )
         frac_pos_dense: Optional[torch.Tensor] = None
         if needs_fractional:
@@ -1099,10 +1447,22 @@ class StructureTransformer(nn.Module):
         tokens = self.norm(tokens)
         cell_features = tokens[:, 0, :]
         atom_features = tokens[:, 1 : max_atoms + 1, :]
+        frac_pos_for_readout = frac_pos_dense
+        atom_mask_for_readout = atom_mask
         if inverse_atom_index_order is not None:
             atom_features = _gather_atom_features(
                 atom_features, inverse_atom_index_order
             )
+            frac_pos_for_readout = _gather_atom_features(
+                frac_pos_dense, inverse_atom_index_order
+            )
+            atom_mask_for_readout = torch.gather(
+                atom_mask,
+                dim=1,
+                index=inverse_atom_index_order,
+            )
+        else:
+            atom_mask_for_readout = output_atom_mask
 
         atom_energy = self.atom_energy_head(atom_features).squeeze(-1)
         atom_energy = atom_energy * output_atom_mask.to(dtype=atom_energy.dtype)
@@ -1112,7 +1472,14 @@ class StructureTransformer(nn.Module):
 
         outputs = {"energy": energy}
         if self.regress_forces:
-            forces = self.force_head(atom_features)[output_atom_mask]
+            force_features = atom_features
+            if self.force_readout_type == "pair_cross_attention":
+                force_features = self.force_pair_readout(
+                    atom_features,
+                    frac_pos_for_readout,
+                    atom_mask_for_readout,
+                )
+            forces = self.force_head(force_features)[output_atom_mask]
             if self.edge_vector_head:
                 edge_vectors, edge_centers, edge_neighbors = self._check_edge_inputs(
                     edge_vectors,
@@ -1131,7 +1498,14 @@ class StructureTransformer(nn.Module):
                     forces = forces + edge_forces
             outputs["forces"] = forces
         if self.regress_stress:
-            atom_stress = self.atom_stress_head(atom_features)
+            stress_features = atom_features
+            if self.stress_readout_type == "pair_cross_attention":
+                stress_features = self.stress_pair_readout(
+                    atom_features,
+                    frac_pos_for_readout,
+                    atom_mask_for_readout,
+                )
+            atom_stress = self.atom_stress_head(stress_features)
             stress_mask = output_atom_mask.unsqueeze(-1).to(dtype=atom_stress.dtype)
             num_atoms = stress_mask.sum(dim=1).clamp_min(1.0)
             stress = (atom_stress * stress_mask).sum(dim=1) / num_atoms

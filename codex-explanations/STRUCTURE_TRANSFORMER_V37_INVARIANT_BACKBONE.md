@@ -259,19 +259,19 @@ I added `options-structure-transformer-mptrj-salex-direct-160k-v37.yaml` as a
 v37-style variant of `options-structure-transformer-mptrj-salex-direct-160k.yaml`.
 It keeps the same MPtrj/sAlex data, optimization schedule, target definitions,
 and model size, but changes the backbone settings that determine the symmetry
-behavior. It also sets `architecture.training.use_data_augmentation: false`, so
-training does not apply the PET random rotation/inversion augmenter:
+behavior. The current YAML leaves `architecture.training.use_data_augmentation:
+true`; add a run override if you want a no-augmentation ablation:
 
 ```yaml
 architecture:
   name: experimental.structure_transformer
   training:
-    use_data_augmentation: false
+    use_data_augmentation: true
   model:
     position_representation: fractional
     coordinate_encoding: v37_torus_relative
     coord_num_harmonics: 4
-    coord_encoder_chunk_size: 32
+    coord_encoder_chunk_size: 128
     coord_encoder_use_checkpoint: true
     use_rotary_embeddings: false
     use_periodic_rope: true
@@ -295,12 +295,13 @@ The important differences from the starting config are:
   is handled by the transformer as a set order rather than as positional metadata.
 - `atom_embedding_type: scalar` matches the notebook's scalar Fourier encoding
   for atom numbers; the embedding-table path remains available through config.
-- `coord_encoder_chunk_size: 32` and `coord_encoder_use_checkpoint: true`
+- `coord_encoder_chunk_size: 128` and `coord_encoder_use_checkpoint: true`
   reduce the training memory of the v37 all-pairs coordinate encoder without
   removing large structures from the dataset.
-- `architecture.training.use_data_augmentation: false` removes
-  the PET `RotationalAugmenter` from the training path, disabling both random
-  rotations and random inversions.
+- `architecture.training.use_data_augmentation: true` keeps the PET
+  `RotationalAugmenter` in the training path. To disable both random rotations
+  and random inversions for an ablation, run with
+  `-r architecture.training.use_data_augmentation=false`.
 
 ### Memory and Large MPtrj Structures
 
@@ -365,8 +366,8 @@ is smaller by roughly
 \frac{C}{N_{\max}}.
 ```
 
-With `coord_encoder_chunk_size: 32` and a 400-atom structure, that pair-hidden
-peak is about `32 / 400 = 0.08` of the unchunked receiver dimension. The config
+With `coord_encoder_chunk_size: 128` and a 400-atom structure, that pair-hidden
+peak is about `128 / 400 = 0.32` of the unchunked receiver dimension. The config
 also sets `coord_encoder_use_checkpoint: true`, which routes each receiver chunk
 through
 
@@ -506,7 +507,7 @@ chunk = activation_checkpoint(
 The v37 YAML enables this path with:
 
 ```yaml
-coord_encoder_chunk_size: 32
+coord_encoder_chunk_size: 128
 coord_encoder_use_checkpoint: true
 ```
 
@@ -598,6 +599,213 @@ The regression tests now check both sides of that claim: chunked and unchunked
 models with identical weights produce the same outputs, and checkpointed chunks
 can backpropagate through `position_encoder.pair_mlp`.
 
+
+### Pair Cross-Attention Prediction Head
+
+I added an optional prediction-head transformer for force and stress readout. It
+is implemented in `PairCrossAttentionReadout` and
+`PairCrossAttentionReadoutLayer` in
+`src/metatrain/experimental/structure_transformer/modules/transformer.py`. The
+old behavior remains the default:
+
+```math
+\texttt{force\_readout\_type}=\texttt{mlp},\qquad
+\texttt{stress\_readout\_type}=\texttt{mlp}.
+```
+
+The v37 YAML now enables the new head with:
+
+```yaml
+force_readout_type: pair_cross_attention
+stress_readout_type: pair_cross_attention
+pair_readout_num_heads: null
+pair_readout_hidden_dim: null
+pair_readout_num_layers: 1
+pair_readout_dropout: null
+pair_readout_chunk_size: 64
+pair_readout_use_checkpoint: false
+pair_readout_include_pair_geometry: false
+pair_readout_exclude_self: true
+```
+
+Let the backbone output atom latents
+
+```math
+H=(h_1,\ldots,h_N),\qquad h_i\in\mathbb{R}^{D}.
+```
+
+For each readout layer, receiver atom `i` keeps its own latent state `y_i`,
+initialized as `y_i=h_i`. The source sequence is fixed to the original backbone
+latents `H`; it is not replaced by the readout outputs of other atoms. This is
+the key distinction from adding persistent edge/node message-passing tokens. In
+code, `PairCrossAttentionReadout.forward` does:
+
+```python
+source_state = atom_features * atom_mask.unsqueeze(-1).to(dtype=atom_features.dtype)
+state = source_state
+...
+chunk = layer(receiver_state, source_state, atom_mask[:, start:end], atom_mask, ...)
+```
+
+For attention head `r`, with head width `d_h=D/R`, the layer computes
+
+```math
+q_i^{(r)}=W_Q^{(r)}\operatorname{RMSNorm}(y_i),\qquad
+k_j^{(r)}=W_K^{(r)}\operatorname{RMSNorm}(h_j),\qquad
+v_j^{(r)}=W_V^{(r)}\operatorname{RMSNorm}(h_j).
+```
+
+The valid source set is
+
+```math
+\mathcal{S}_i=
+\begin{cases}
+\{j: \texttt{mask}_j=1,\ j\ne i\}, & \text{if this set is nonempty},\\
+\{j: \texttt{mask}_j=1\}, & \text{single-atom fallback}.
+\end{cases}
+```
+
+The default readout uses no additional pair geometry, so the attention bias is
+zero:
+
+```math
+b_{ij}^{(r)}=0.
+```
+
+The optional setting `pair_readout_include_pair_geometry: true` adds only a
+periodic scalar bias to the attention scores,
+
+```math
+b_{ij}^{(r)}=(w^{(r)})^T\phi(u_i-u_j),
+```
+
+where `phi` is the same integer-harmonic torus Fourier feature family used
+elsewhere:
+
+```math
+\phi(u_i-u_j)=
+\left[
+\cos(2\pi m(u_{i,d}-u_{j,d})),
+\sin(2\pi m(u_{i,d}-u_{j,d}))
+\right]_{d=1}^3{}_{m=1}^{M}.
+```
+
+This flag is off in the v37 config because the intended ablation is to test
+whether the backbone's atom latents can support force/stress prediction without
+adding another explicit pair-coordinate feature in the prediction head.
+
+The cross-attention weights and update are
+
+```math
+\alpha_{ij}^{(r)} =
+\operatorname{softmax}_{j\in\mathcal{S}_i}
+\left(
+\frac{(q_i^{(r)})^T k_j^{(r)}}{\sqrt{d_h}} + b_{ij}^{(r)}
+\right),
+```
+
+```math
+c_i= W_O\operatorname{concat}_{r=1}^{R}
+\left(\sum_{j\in\mathcal{S}_i}\alpha_{ij}^{(r)}v_j^{(r)}\right),
+```
+
+```math
+y_i' = y_i + c_i,
+\qquad
+y_i^{\mathrm{out}} = y_i' + \operatorname{SwiGLU}(\operatorname{RMSNorm}(y_i')).
+```
+
+The force and stress heads use separate readout modules, so their parameters are
+decoupled:
+
+```python
+if self.force_readout_type == "pair_cross_attention":
+    force_features = self.force_pair_readout(
+        atom_features, frac_pos_for_readout, atom_mask_for_readout
+    )
+forces = self.force_head(force_features)[output_atom_mask]
+```
+
+```python
+if self.stress_readout_type == "pair_cross_attention":
+    stress_features = self.stress_pair_readout(
+        atom_features, frac_pos_for_readout, atom_mask_for_readout
+    )
+atom_stress = self.atom_stress_head(stress_features)
+```
+
+Mathematically, the final outputs become
+
+```math
+F_i = \operatorname{MLP}_F(g_i^F),
+```
+
+```math
+\sigma = \frac{1}{N}\sum_{i=1}^{N}\operatorname{MLP}_\sigma(g_i^\sigma)
+       + \operatorname{MLP}_\sigma^{cell}(h_{cell}),
+```
+
+where
+
+```math
+g_i^F=R_F(h_i,H,U),\qquad g_i^\sigma=R_\sigma(h_i,H,U)
+```
+
+are produced by the force and stress readout transformers respectively. With
+`pair_readout_include_pair_geometry: false`, `U` enters this readout only through
+the already-computed backbone latents `H`.
+
+The symmetry behavior is inherited or preserved operation-by-operation:
+
+| Operation | Periodicity | Global translation | Permutation | Code location |
+| --- | --- | --- | --- | --- |
+| Node-latent cross-attention scores `q_i^T k_j` | Inherits from `h_i` | Inherits from `h_i` | Equivariant, because projections are shared and source atoms are masked as a set | `PairCrossAttentionReadoutLayer.forward` |
+| Optional bias `w^T phi(u_i-u_j)` | Preserved by integer Fourier features | Preserved because only differences appear | Pair-tensor equivariant | `_pair_geometry_bias` |
+| Self/padding masking | Neutral | Neutral | Preserved when atom rows and masks are permuted together | `valid_pair`, `non_self_pair` |
+| Chunking over receivers | Neutral | Neutral | Preserved because chunks are temporary slices then concatenated | `PairCrossAttentionReadout.forward` |
+| Final force MLP | Preserves | Preserves | Atom-output equivariant | `force_head(force_features)[output_atom_mask]` |
+| Final stress average | Preserves | Preserves | System-output invariant | `atom_stress * stress_mask`, `.sum(dim=1) / num_atoms` |
+
+For complexity, let `B` be dense batch size, `N` max atoms, `D` model width, `R`
+attention heads, and `C` the receiver chunk size. One pair readout layer has
+attention compute
+
+```math
+T_{\mathrm{attn}}=\Theta(BN^2D),
+```
+
+plus per-atom feed-forward compute
+
+```math
+T_{\mathrm{mlp}}=\Theta(BNDH_{\mathrm{readout}}).
+```
+
+The important memory term is not a persistent
+`B x N x N x D` edge-token state. The implementation chunks receivers, so the
+largest attention-score tensor has shape
+
+```math
+B\times R\times C\times N,
+```
+
+and the source/key/value tensors have scale
+
+```math
+\Theta(BND).
+```
+
+Thus the peak readout activation memory is roughly
+
+```math
+S_{\mathrm{readout}}=\Theta(BRCN+BND),
+```
+
+rather than storing edge latents of size `Theta(BN^2D)`. Enabling both force and
+stress readouts doubles this head cost because `force_pair_readout` and
+`stress_pair_readout` are separate modules. If needed, `pair_readout_use_checkpoint:
+true` routes each receiver chunk through `torch.utils.checkpoint`, trading extra
+backward recomputation for lower saved activation memory.
+
 Run a single-process CUDA training job with:
 
 ```bash
@@ -606,8 +814,8 @@ Run a single-process CUDA training job with:
   --output outputs/structure-transformer-metatrain-160k-v37/model.pt
 ```
 
-Your current DDP command can be run as-is with this config because the YAML already
-sets `use_data_augmentation: false`:
+Your current DDP command can be run as-is with this config. For a no-augmentation
+ablation, add `-r architecture.training.use_data_augmentation=false`:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 \

@@ -8,7 +8,7 @@
 
 wandb:
   project: pet-oam-mptrj
-  name: structure-transformer-metatrain-160k-v37
+  name: structure-transformer-metatrain-160k-v37-thead
   entity: null
   mode: online
 
