@@ -14,6 +14,10 @@ from metatomic.torch import (
     System,
 )
 
+from metatrain.pet.modules.adaptive_cutoff import (
+    get_adaptive_cutoffs_grid,
+    get_adaptive_cutoffs_solver,
+)
 from metatrain.pet.modules.utilities import cutoff_func_bump, cutoff_func_cosine
 from metatrain.utils.abc import ModelInterface
 from metatrain.utils.additive import CompositionModel
@@ -253,14 +257,52 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
             torch.cat(edge_neighbors_list, dim=0),
         )
 
-    def _graph_cutoff_factors(self, edge_distances: torch.Tensor) -> torch.Tensor:
+    def _graph_pair_cutoffs(
+        self,
+        centers: torch.Tensor,
+        neighbors: torch.Tensor,
+        edge_distances: torch.Tensor,
+        num_atoms: int,
+    ) -> torch.Tensor:
+        num_neighbors_adaptive = (
+            self.transformer.graph_attention_num_neighbors_adaptive
+        )
+        if num_neighbors_adaptive is None:
+            return edge_distances.new_full(
+                edge_distances.shape,
+                self.transformer.graph_attention_cutoff,
+            )
+
+        cutoff_method = self.transformer.graph_attention_adaptive_cutoff_method.lower()
+        if cutoff_method == "solver":
+            atomic_cutoffs = get_adaptive_cutoffs_solver(
+                centers,
+                edge_distances,
+                num_neighbors_adaptive,
+                num_atoms,
+                self.transformer.graph_attention_cutoff,
+                cutoff_width=self.transformer.graph_attention_cutoff_width,
+            )
+        elif cutoff_method == "grid":
+            atomic_cutoffs = get_adaptive_cutoffs_grid(
+                centers,
+                edge_distances,
+                num_neighbors_adaptive,
+                num_atoms,
+                self.transformer.graph_attention_cutoff,
+                cutoff_width=self.transformer.graph_attention_cutoff_width,
+            )
+        else:
+            raise RuntimeError("invalid graph attention adaptive cutoff method")
+
+        return (atomic_cutoffs[centers] + atomic_cutoffs[neighbors]) / 2.0
+
+    def _graph_cutoff_factors(
+        self, edge_distances: torch.Tensor, pair_cutoffs: torch.Tensor
+    ) -> torch.Tensor:
         if self.graph_attention == "binary":
             return edge_distances.new_ones(edge_distances.shape)
 
-        pair_cutoffs = edge_distances.new_full(
-            edge_distances.shape,
-            self.transformer.graph_attention_cutoff,
-        )
         cutoff_function = self.transformer.graph_attention_cutoff_function.lower()
         if cutoff_function == "bump":
             return cutoff_func_bump(
@@ -331,11 +373,25 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
                 dtype=dtype,
             )
             edge_distances = torch.linalg.norm(edge_vectors, dim=-1) + 1.0e-15
-            edge_factors = self._graph_cutoff_factors(edge_distances)
+            centers = samples[:, 0]
+            neighbors = samples[:, 1]
+            pair_cutoffs = self._graph_pair_cutoffs(
+                centers, neighbors, edge_distances, num_atoms
+            )
+            if self.transformer.graph_attention_num_neighbors_adaptive is not None:
+                keep = torch.nonzero(edge_distances <= pair_cutoffs).squeeze(-1)
+                if keep.numel() == 0:
+                    continue
+                centers = centers.index_select(0, keep)
+                neighbors = neighbors.index_select(0, keep)
+                edge_distances = edge_distances.index_select(0, keep)
+                pair_cutoffs = pair_cutoffs.index_select(0, keep)
+
+            edge_factors = self._graph_cutoff_factors(edge_distances, pair_cutoffs)
             self._scatter_max_graph_factors(
                 cutoff_factors[i_system, :num_atoms, :num_atoms],
-                samples[:, 0],
-                samples[:, 1],
+                centers,
+                neighbors,
                 edge_factors,
             )
 

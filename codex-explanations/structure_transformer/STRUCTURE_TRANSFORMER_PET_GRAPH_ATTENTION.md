@@ -255,6 +255,149 @@ raw_outputs = self.transformer(
 )
 ```
 
+## PET-Matched Adaptive Cutoff Option
+
+The original graph-attention implementation used a fixed graph cutoff:
+
+```math
+r_{ij}=r_{\mathrm{graph}}.
+```
+
+That is PET-inspired, but it is not identical to the current
+`options-pet-oam-l-modern-mptrj-salex.yaml` graph construction. PET OAM-L-modern
+uses:
+
+```yaml
+cutoff: 10.0
+num_neighbors_adaptive: 40
+adaptive_cutoff_method: grid
+cutoff_function: Bump
+cutoff_width: 0.5
+```
+
+To match that graph prior more closely, Structure Transformer now exposes:
+
+```yaml
+graph_attention_cutoff: 10.0
+graph_attention_num_neighbors_adaptive: 40
+graph_attention_adaptive_cutoff_method: grid
+graph_attention_cutoff_function: Bump
+graph_attention_cutoff_width: 0.5
+```
+
+When `graph_attention_num_neighbors_adaptive: null`, the old fixed-cutoff
+behavior is unchanged. When it is set, the wrapper first requests the neighbor
+list up to the maximum graph cutoff:
+
+```math
+E_{\max}
+=
+\left\{
+(i,j,\eta):
+\rho_{ij}^{\eta}\le r_{\max}
+\right\},
+\qquad
+r_{\max}=\texttt{graph\_attention\_cutoff}.
+```
+
+Then it reuses PET's adaptive cutoff helpers:
+
+```python
+from metatrain.pet.modules.adaptive_cutoff import (
+    get_adaptive_cutoffs_grid,
+    get_adaptive_cutoffs_solver,
+)
+```
+
+The adaptive cutoff selects one radius per atom:
+
+```math
+r_i\in (0,r_{\max}]
+```
+
+so the smoothed effective neighbor count is close to the target
+`n_bar = graph_attention_num_neighbors_adaptive`. In the solver formulation,
+PET defines
+
+```math
+n_i(r)
+=
+\sum_{(i,j,\eta)\in E_{\max}}
+c_{\mathrm{bump}}
+\left(
+\rho_{ij}^{\eta}; r, w
+\right)
++
+\bar n
+\left(\frac{r}{r_{\max}}\right)^3,
+```
+
+and solves approximately
+
+```math
+n_i(r_i)=\bar n.
+```
+
+For the grid method, PET evaluates a grid of probe cutoffs and computes a
+Gaussian-weighted average of the probes whose effective neighbor counts are
+closest to `n_bar`. This preserves the older PET OAM-L-modern behavior.
+
+After computing per-atom cutoffs, PET symmetrizes them on every directed edge:
+
+```math
+r_{ij}^{\mathrm{cut}}
+=
+\frac{r_i+r_j}{2}.
+```
+
+The Structure Transformer wrapper mirrors the same pair cutoff:
+
+```python
+return (atomic_cutoffs[centers] + atomic_cutoffs[neighbors]) / 2.0
+```
+
+Then it prunes the maximum-cutoff neighbor list:
+
+```math
+E_{\mathrm{adapt}}
+=
+\left\{
+(i,j,\eta)\in E_{\max}:
+\rho_{ij}^{\eta}
+\le
+\frac{r_i+r_j}{2}
+\right\}.
+```
+
+Finally, the retained edges receive PET cutoff factors with the adaptive pair
+cutoffs:
+
+```math
+c_{ij}^{\eta}
+=
+c
+\left(
+\rho_{ij}^{\eta};
+\frac{r_i+r_j}{2},
+w
+\right).
+```
+
+The remaining Structure Transformer-specific step is still the atom-pair
+collapse:
+
+```math
+c_{ij}
+=
+\max_{\eta:(i,j,\eta)\in E_{\mathrm{adapt}}}
+c_{ij}^{\eta}.
+```
+
+So the graph construction is now much closer to PET, but the representation is
+still not PET-equivalent. PET keeps every image edge `(i,j,eta)` as a separate
+interaction object; Structure Transformer still injects one scalar bias into
+the single atom-token attention entry `(i,j)`.
+
 ## Attention Injection Point
 
 `MultiHeadAttention.forward` in
@@ -321,6 +464,8 @@ The new hyperparameters are exposed in
 ```yaml
 graph_attention: none              # none | binary | smooth_cutoff
 graph_attention_cutoff: 4.5
+graph_attention_num_neighbors_adaptive: null
+graph_attention_adaptive_cutoff_method: solver
 graph_attention_cutoff_width: 0.5
 graph_attention_cutoff_function: Bump
 graph_attention_bias_strength: 1.0
@@ -332,6 +477,20 @@ The v37 config currently enables the PET-style smooth prior:
 ```yaml
 graph_attention: smooth_cutoff
 graph_attention_cutoff: 4.5
+graph_attention_cutoff_width: 0.5
+graph_attention_cutoff_function: Bump
+graph_attention_bias_strength: 1.0
+graph_attention_epsilon: 1.0e-15
+```
+
+The PET-matched v37 graph config enables the adaptive OAM-L-modern graph
+construction:
+
+```yaml
+graph_attention: smooth_cutoff
+graph_attention_cutoff: 10.0
+graph_attention_num_neighbors_adaptive: 40
+graph_attention_adaptive_cutoff_method: grid
 graph_attention_cutoff_width: 0.5
 graph_attention_cutoff_function: Bump
 graph_attention_bias_strength: 1.0
@@ -419,6 +578,27 @@ S_{\mathrm{graph}}=\Theta(BN^2),
 
 because the sparse graph is densified to match the global transformer attention
 matrix.
+
+With adaptive cutoffs, PET's grid method adds
+
+```math
+\Theta(P E_{\max})
+```
+
+work, where `P` is the number of probe cutoff radii and `E_max` is the number
+of edges inside `graph_attention_cutoff`. The solver method instead performs a
+fixed number of scatter reductions over `E_max`, so its cost is
+
+```math
+\Theta(I E_{\max})
+```
+
+for `I` Newton-bisection iterations. After adaptive pruning, the final dense
+bias is still
+
+```math
+B\times N\times N.
+```
 
 Each transformer block already forms attention logits of size
 

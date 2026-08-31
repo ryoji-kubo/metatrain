@@ -105,7 +105,7 @@
       "args": [
         "--debug",
         "train",
-        "options-structure-transformer-mptrj-salex-direct-160k-v37.yaml",
+        "options-structure-transformer-mptrj-salex-direct-160k-v37-graph.yaml",
         "-o",
         "structure-transformer-mptrj-salex-v37-debug.pt",
         "-r",

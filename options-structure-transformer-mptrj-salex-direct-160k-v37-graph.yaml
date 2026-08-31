@@ -76,6 +76,10 @@ architecture:
     # recovers the ungated all-to-all transformer attention.
     graph_attention: smooth_cutoff
     graph_attention_cutoff: 10.0
+    # Match PET OAM-L-modern's adaptive graph construction: build edges up to
+    # 10 A, then choose per-atom cutoffs targeting about 40 neighbors.
+    graph_attention_num_neighbors_adaptive: 40
+    graph_attention_adaptive_cutoff_method: grid
     graph_attention_cutoff_width: 0.5
     graph_attention_cutoff_function: Bump
     graph_attention_bias_strength: 1.0

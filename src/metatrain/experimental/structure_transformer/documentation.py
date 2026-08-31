@@ -115,6 +115,12 @@ class ModelHypers(TypedDict):
     graph_attention_cutoff: float = 4.5
     """Neighbor-list cutoff radius used for graph attention."""
 
+    graph_attention_num_neighbors_adaptive: Optional[int] = None
+    """PET-style target effective neighbor count for adaptive graph cutoffs."""
+
+    graph_attention_adaptive_cutoff_method: Literal["grid", "solver"] = "solver"
+    """PET adaptive cutoff method used when adaptive graph neighbors are set."""
+
     graph_attention_cutoff_width: float = 0.5
     """Width of the PET cutoff transition used for smooth graph attention."""
 

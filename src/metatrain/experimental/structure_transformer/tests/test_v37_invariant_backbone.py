@@ -66,6 +66,8 @@ def _v37_kwargs(**overrides):
         "pair_readout_exclude_self": True,
         "graph_attention": "none",
         "graph_attention_cutoff": 4.5,
+        "graph_attention_num_neighbors_adaptive": None,
+        "graph_attention_adaptive_cutoff_method": "solver",
         "graph_attention_cutoff_width": 0.5,
         "graph_attention_cutoff_function": "Bump",
         "graph_attention_bias_strength": 1.0,
@@ -337,6 +339,8 @@ def test_v37_hyperparameters_are_exposed_to_config_and_wrapper():
     assert hypers["pair_readout_include_pair_geometry"] is False
     assert hypers["graph_attention"] == "none"
     assert hypers["graph_attention_cutoff"] == 4.5
+    assert hypers["graph_attention_num_neighbors_adaptive"] is None
+    assert hypers["graph_attention_adaptive_cutoff_method"] == "solver"
     assert hypers["graph_attention_cutoff_width"] == 0.5
     assert hypers["graph_attention_cutoff_function"] == "Bump"
     assert hypers["graph_attention_bias_strength"] == 1.0
@@ -424,6 +428,18 @@ def test_v37_rejects_index_ordering_and_double_rope():
 
     with pytest.raises(ValueError, match="graph_attention_bias_strength"):
         StructureTransformer(**_v37_kwargs(graph_attention_bias_strength=-1.0))
+
+    with pytest.raises(ValueError, match="graph_attention_num_neighbors_adaptive"):
+        StructureTransformer(
+            **_v37_kwargs(graph_attention_num_neighbors_adaptive=0)
+        )
+
+    with pytest.raises(ValueError, match="graph_attention_adaptive_cutoff_method"):
+        StructureTransformer(
+            **_v37_kwargs(
+                graph_attention_adaptive_cutoff_method="nearest_neighbor"
+            )
+        )
 
     with pytest.raises(ValueError, match="atom_ordering='none'"):
         StructureTransformer(

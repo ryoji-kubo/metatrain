@@ -915,6 +915,8 @@ class StructureTransformer(nn.Module):
         pair_readout_exclude_self: bool = True,
         graph_attention: str = "none",
         graph_attention_cutoff: float = 4.5,
+        graph_attention_num_neighbors_adaptive: Optional[float] = None,
+        graph_attention_adaptive_cutoff_method: str = "solver",
         graph_attention_cutoff_width: float = 0.5,
         graph_attention_cutoff_function: str = "Bump",
         graph_attention_bias_strength: float = 1.0,
@@ -1023,6 +1025,23 @@ class StructureTransformer(nn.Module):
             raise ValueError("graph_attention_cutoff must be positive")
         if graph_attention_cutoff_width <= 0.0:
             raise ValueError("graph_attention_cutoff_width must be positive")
+        if (
+            graph_attention_num_neighbors_adaptive is not None
+            and graph_attention_num_neighbors_adaptive <= 0.0
+        ):
+            raise ValueError(
+                "graph_attention_num_neighbors_adaptive must be positive when provided"
+            )
+        valid_adaptive_cutoff_methods = {"grid", "solver"}
+        if (
+            graph_attention_adaptive_cutoff_method.lower()
+            not in valid_adaptive_cutoff_methods
+        ):
+            raise ValueError(
+                "graph_attention_adaptive_cutoff_method must be one of "
+                f"{sorted(valid_adaptive_cutoff_methods)}, "
+                f"got {graph_attention_adaptive_cutoff_method!r}"
+            )
         if graph_attention_bias_strength < 0.0:
             raise ValueError("graph_attention_bias_strength must be non-negative")
         if graph_attention_epsilon <= 0.0:
@@ -1093,6 +1112,14 @@ class StructureTransformer(nn.Module):
         self.pair_readout_exclude_self = pair_readout_exclude_self
         self.graph_attention = graph_attention
         self.graph_attention_cutoff = float(graph_attention_cutoff)
+        self.graph_attention_num_neighbors_adaptive = (
+            float(graph_attention_num_neighbors_adaptive)
+            if graph_attention_num_neighbors_adaptive is not None
+            else None
+        )
+        self.graph_attention_adaptive_cutoff_method = (
+            graph_attention_adaptive_cutoff_method
+        )
         self.graph_attention_cutoff_width = float(graph_attention_cutoff_width)
         self.graph_attention_cutoff_function = graph_attention_cutoff_function
         self.graph_attention_bias_strength = float(graph_attention_bias_strength)
