@@ -14,6 +14,7 @@ from metatomic.torch import (
     System,
 )
 
+from metatrain.pet.modules.utilities import cutoff_func_bump, cutoff_func_cosine
 from metatrain.utils.abc import ModelInterface
 from metatrain.utils.additive import CompositionModel
 from metatrain.utils.data import DatasetInfo, TargetInfo
@@ -54,14 +55,34 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
         transformer_hypers.pop("symmetrize_stress", None)
         self.transformer = StructureTransformer(**transformer_hypers)
         self.edge_vector_head = self.transformer.edge_vector_head
+        self.graph_attention = self.transformer.graph_attention
+        self.uses_graph_attention = (
+            self.graph_attention != "none"
+            and self.transformer.graph_attention_bias_strength > 0.0
+        )
         edge_vector_head_cutoff = (
             self.transformer.edge_vector_head_cutoff if self.edge_vector_head else 1.0
         )
-        self.requested_nl = NeighborListOptions(
+        graph_attention_cutoff = (
+            self.transformer.graph_attention_cutoff if self.uses_graph_attention else 1.0
+        )
+        self.edge_requested_nl = NeighborListOptions(
             cutoff=edge_vector_head_cutoff,
             full_list=True,
             strict=True,
         )
+        if self.edge_vector_head and self.uses_graph_attention and (
+            graph_attention_cutoff == edge_vector_head_cutoff
+        ):
+            self.graph_requested_nl = self.edge_requested_nl
+        else:
+            self.graph_requested_nl = NeighborListOptions(
+                cutoff=graph_attention_cutoff,
+                full_list=True,
+                strict=True,
+            )
+        # Backwards-compatible alias used by the edge-vector helper path.
+        self.requested_nl = self.edge_requested_nl
 
         self.outputs: Dict[str, ModelOutput] = {}
         self._target_to_raw_output: Dict[str, str] = {}
@@ -131,13 +152,20 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
         )
 
     def requested_neighbor_lists(self) -> List[NeighborListOptions]:
+        requested: List[NeighborListOptions] = []
         if self.edge_vector_head:
-            return [self.requested_nl]
+            requested.append(self.edge_requested_nl)
+        if self.uses_graph_attention:
+            if (
+                not self.edge_vector_head
+                or self.graph_requested_nl.cutoff != self.edge_requested_nl.cutoff
+            ):
+                requested.append(self.graph_requested_nl)
 
         # The copied transformer is a global sequence model and, by default, does not
         # consume local neighbor lists. Returning an empty list lets the PET trainer
         # keep the same collate stack while avoiding unnecessary neighbor construction.
-        return []
+        return requested
 
     def supported_outputs(self) -> Dict[str, ModelOutput]:
         return self.outputs
@@ -208,7 +236,7 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
         edge_neighbors_list: List[torch.Tensor] = []
         atom_offset = 0
         for system in systems:
-            neighbor_list = system.get_neighbor_list(self.requested_nl)
+            neighbor_list = system.get_neighbor_list(self.edge_requested_nl)
             samples = neighbor_list.samples.values.to(device=device, dtype=torch.long)
             edge_vectors = neighbor_list.values.squeeze(-1).to(
                 device=device,
@@ -223,6 +251,99 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
             torch.cat(edge_vectors_list, dim=0),
             torch.cat(edge_centers_list, dim=0),
             torch.cat(edge_neighbors_list, dim=0),
+        )
+
+    def _graph_cutoff_factors(self, edge_distances: torch.Tensor) -> torch.Tensor:
+        if self.graph_attention == "binary":
+            return edge_distances.new_ones(edge_distances.shape)
+
+        pair_cutoffs = edge_distances.new_full(
+            edge_distances.shape,
+            self.transformer.graph_attention_cutoff,
+        )
+        cutoff_function = self.transformer.graph_attention_cutoff_function.lower()
+        if cutoff_function == "bump":
+            return cutoff_func_bump(
+                edge_distances,
+                pair_cutoffs,
+                self.transformer.graph_attention_cutoff_width,
+            )
+        if cutoff_function == "cosine":
+            return cutoff_func_cosine(
+                edge_distances,
+                pair_cutoffs,
+                self.transformer.graph_attention_cutoff_width,
+            )
+        raise RuntimeError("invalid graph attention cutoff function")
+
+    @staticmethod
+    def _scatter_max_graph_factors(
+        dense_factors: torch.Tensor,
+        centers: torch.Tensor,
+        neighbors: torch.Tensor,
+        edge_factors: torch.Tensor,
+    ) -> None:
+        if centers.numel() == 0:
+            return
+
+        num_atoms = dense_factors.shape[0]
+        flat_index = centers * num_atoms + neighbors
+        flat_factors = dense_factors.reshape(-1)
+        if hasattr(flat_factors, "scatter_reduce_"):
+            flat_factors.scatter_reduce_(
+                0,
+                flat_index,
+                edge_factors,
+                reduce="amax",
+                include_self=True,
+            )
+            return
+
+        for index, value in zip(flat_index.tolist(), edge_factors):
+            flat_factors[index] = torch.maximum(flat_factors[index], value)
+
+    def _systems_to_graph_attention_bias(self, systems: List[System]) -> torch.Tensor:
+        device = systems[0].positions.device
+        dtype = systems[0].positions.dtype
+        batch_size = len(systems)
+        max_atoms = max(len(system) for system in systems)
+        cutoff_factors = torch.zeros(
+            (batch_size, max_atoms, max_atoms),
+            device=device,
+            dtype=dtype,
+        )
+
+        for i_system, system in enumerate(systems):
+            num_atoms = len(system)
+            if num_atoms == 0:
+                continue
+
+            diagonal = torch.arange(num_atoms, device=device)
+            cutoff_factors[i_system, diagonal, diagonal] = 1.0
+
+            neighbor_list = system.get_neighbor_list(self.graph_requested_nl)
+            samples = neighbor_list.samples.values.to(device=device, dtype=torch.long)
+            if samples.numel() == 0:
+                continue
+
+            edge_vectors = neighbor_list.values.squeeze(-1).to(
+                device=device,
+                dtype=dtype,
+            )
+            edge_distances = torch.linalg.norm(edge_vectors, dim=-1) + 1.0e-15
+            edge_factors = self._graph_cutoff_factors(edge_distances)
+            self._scatter_max_graph_factors(
+                cutoff_factors[i_system, :num_atoms, :num_atoms],
+                samples[:, 0],
+                samples[:, 1],
+                edge_factors,
+            )
+
+        cutoff_factors = cutoff_factors.clamp_min(
+            self.transformer.graph_attention_epsilon
+        )
+        return self.transformer.graph_attention_bias_strength * torch.log(
+            cutoff_factors
         )
 
     def _system_samples(self, systems: List[System], device: torch.device) -> Labels:
@@ -327,6 +448,10 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
         selected_atoms: Optional[Labels] = None,
     ) -> Dict[str, TensorMap]:
         data = self._systems_to_transformer_data(systems)
+        graph_attention_bias: Optional[torch.Tensor] = None
+        if self.uses_graph_attention:
+            graph_attention_bias = self._systems_to_graph_attention_bias(systems)
+
         if self.edge_vector_head:
             edge_vectors, edge_centers, edge_neighbors = self._systems_to_edge_data(
                 systems
@@ -336,9 +461,13 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
                 edge_vectors=edge_vectors,
                 edge_centers=edge_centers,
                 edge_neighbors=edge_neighbors,
+                graph_attention_bias=graph_attention_bias,
             )
         else:
-            raw_outputs = self.transformer(data)
+            raw_outputs = self.transformer(
+                data,
+                graph_attention_bias=graph_attention_bias,
+            )
         return_dict = self._raw_outputs_to_tensormaps(
             systems, raw_outputs, outputs, selected_atoms
         )

@@ -448,6 +448,7 @@ class MultiHeadAttention(nn.Module):
         rotary_pe_cplx: Optional[torch.Tensor] = None,
         rotary_position_ids: Optional[torch.Tensor] = None,
         periodic_rope_coords: Optional[torch.Tensor] = None,
+        attention_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, embed_dim = x.shape
         q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
@@ -500,6 +501,15 @@ class MultiHeadAttention(nn.Module):
             attn[:, :, 0, :] = unrotated_attn[:, :, 0, :]
             attn[:, :, :, 0] = unrotated_attn[:, :, :, 0]
         attn = attn * self.scale
+        if attention_bias is not None:
+            if attention_bias.shape != (batch_size, seq_len, seq_len):
+                raise ValueError(
+                    "attention_bias must have shape [B, seq_len, seq_len]"
+                )
+            attn = attn + attention_bias.to(
+                device=attn.device,
+                dtype=attn.dtype,
+            ).unsqueeze(1)
         attn = attn.masked_fill(
             ~valid_mask.view(batch_size, 1, 1, seq_len),
             -1.0e30,
@@ -564,6 +574,7 @@ class TransformerBlock(nn.Module):
         rotary_pe_cplx: Optional[torch.Tensor] = None,
         rotary_position_ids: Optional[torch.Tensor] = None,
         periodic_rope_coords: Optional[torch.Tensor] = None,
+        attention_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = x + self.attn_drop(
             self.attn(
@@ -572,6 +583,7 @@ class TransformerBlock(nn.Module):
                 rotary_pe_cplx,
                 rotary_position_ids,
                 periodic_rope_coords,
+                attention_bias,
             )
         )
         x = x + self.mlp_drop(self.mlp(self.mlp_norm(x)))
@@ -901,6 +913,12 @@ class StructureTransformer(nn.Module):
         pair_readout_use_checkpoint: bool = False,
         pair_readout_include_pair_geometry: bool = False,
         pair_readout_exclude_self: bool = True,
+        graph_attention: str = "none",
+        graph_attention_cutoff: float = 4.5,
+        graph_attention_cutoff_width: float = 0.5,
+        graph_attention_cutoff_function: str = "Bump",
+        graph_attention_bias_strength: float = 1.0,
+        graph_attention_epsilon: float = 1.0e-15,
         direct_prediction: bool = True,
         avg_num_nodes: float = 1.0,
         d: Optional[int] = None,
@@ -988,6 +1006,32 @@ class StructureTransformer(nn.Module):
             raise ValueError("pair_readout_num_layers must be >= 1")
         if pair_readout_chunk_size is not None and pair_readout_chunk_size <= 0:
             raise ValueError("pair_readout_chunk_size must be positive when provided")
+        valid_graph_attention = {"none", "binary", "smooth_cutoff"}
+        if graph_attention not in valid_graph_attention:
+            raise ValueError(
+                "graph_attention must be one of "
+                f"{sorted(valid_graph_attention)}, got {graph_attention!r}"
+            )
+        valid_cutoff_functions = {"bump", "cosine"}
+        if graph_attention_cutoff_function.lower() not in valid_cutoff_functions:
+            raise ValueError(
+                "graph_attention_cutoff_function must be one of "
+                f"{sorted(valid_cutoff_functions)}, "
+                f"got {graph_attention_cutoff_function!r}"
+            )
+        if graph_attention_cutoff <= 0.0:
+            raise ValueError("graph_attention_cutoff must be positive")
+        if graph_attention_cutoff_width <= 0.0:
+            raise ValueError("graph_attention_cutoff_width must be positive")
+        if graph_attention_bias_strength < 0.0:
+            raise ValueError("graph_attention_bias_strength must be non-negative")
+        if graph_attention_epsilon <= 0.0:
+            raise ValueError("graph_attention_epsilon must be positive")
+        if graph_attention != "none" and atom_ordering != "none":
+            raise ValueError(
+                "graph_attention currently requires atom_ordering='none' so the "
+                "dense graph bias matches token order"
+            )
 
         self.max_num_elements = max_num_elements
         self.embed_dim = embed_dim
@@ -1047,6 +1091,12 @@ class StructureTransformer(nn.Module):
         self.pair_readout_use_checkpoint = pair_readout_use_checkpoint
         self.pair_readout_include_pair_geometry = pair_readout_include_pair_geometry
         self.pair_readout_exclude_self = pair_readout_exclude_self
+        self.graph_attention = graph_attention
+        self.graph_attention_cutoff = float(graph_attention_cutoff)
+        self.graph_attention_cutoff_width = float(graph_attention_cutoff_width)
+        self.graph_attention_cutoff_function = graph_attention_cutoff_function
+        self.graph_attention_bias_strength = float(graph_attention_bias_strength)
+        self.graph_attention_epsilon = float(graph_attention_epsilon)
 
         if self.atom_embedding_type == "embedding":
             self.atom_embedding = nn.Embedding(
@@ -1395,6 +1445,7 @@ class StructureTransformer(nn.Module):
         edge_vectors: Optional[torch.Tensor] = None,
         edge_centers: Optional[torch.Tensor] = None,
         edge_neighbors: Optional[torch.Tensor] = None,
+        graph_attention_bias: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         (
             pos_dense,
@@ -1426,6 +1477,17 @@ class StructureTransformer(nn.Module):
         cell_mask = torch.ones(batch_size, 1, device=atom_mask.device, dtype=torch.bool)
         valid_mask = torch.cat((cell_mask, atom_mask), dim=1)
         cell_condition = self.cell_condition_encoder(cell_flat).unsqueeze(1)
+        sequence_attention_bias: Optional[torch.Tensor] = None
+        if graph_attention_bias is not None:
+            if graph_attention_bias.shape != (batch_size, max_atoms, max_atoms):
+                raise ValueError(
+                    "graph_attention_bias must have shape [B, max_atoms, max_atoms]"
+                )
+            sequence_attention_bias = graph_attention_bias.new_zeros(
+                (batch_size, max_atoms + 1, max_atoms + 1)
+            )
+            sequence_attention_bias[:, 1:, 1:] = graph_attention_bias
+
         rotary_pe_cplx: Optional[torch.Tensor] = None
         if self.use_rotary_embeddings:
             rotary_pe_cplx = _build_complex_pe(
@@ -1442,6 +1504,7 @@ class StructureTransformer(nn.Module):
                 rotary_pe_cplx,
                 rotary_position_ids,
                 frac_pos_dense if self.use_periodic_rope else None,
+                sequence_attention_bias,
             )
 
         tokens = self.norm(tokens)

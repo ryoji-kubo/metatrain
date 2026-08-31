@@ -64,6 +64,12 @@ def _v37_kwargs(**overrides):
         "pair_readout_use_checkpoint": False,
         "pair_readout_include_pair_geometry": False,
         "pair_readout_exclude_self": True,
+        "graph_attention": "none",
+        "graph_attention_cutoff": 4.5,
+        "graph_attention_cutoff_width": 0.5,
+        "graph_attention_cutoff_function": "Bump",
+        "graph_attention_bias_strength": 1.0,
+        "graph_attention_epsilon": 1.0e-15,
         "regress_forces": True,
         "regress_stress": True,
         "avg_num_nodes": 1.0,
@@ -280,6 +286,20 @@ def test_v37_pair_cross_attention_readout_preserves_symmetries(include_pair_geom
     )
 
 
+def test_v37_graph_attention_zero_bias_matches_no_bias():
+    model = _make_model()
+    reference = _predict(model, _data())
+    graph_attention_bias = torch.zeros(1, _POSITIONS.shape[0], _POSITIONS.shape[0])
+
+    with torch.no_grad():
+        biased = model(_data(), graph_attention_bias=graph_attention_bias)
+
+    _assert_system_outputs_close(reference, biased)
+    torch.testing.assert_close(
+        biased["forces"], reference["forces"], atol=1e-5, rtol=1e-5
+    )
+
+
 def test_v37_pair_cross_attention_readout_backpropagates_with_checkpointing():
     model = _make_pair_readout_model(pair_readout_use_checkpoint=True)
     model.train()
@@ -315,6 +335,11 @@ def test_v37_hyperparameters_are_exposed_to_config_and_wrapper():
     assert hypers["stress_readout_type"] == "mlp"
     assert hypers["pair_readout_chunk_size"] is None
     assert hypers["pair_readout_include_pair_geometry"] is False
+    assert hypers["graph_attention"] == "none"
+    assert hypers["graph_attention_cutoff"] == 4.5
+    assert hypers["graph_attention_cutoff_width"] == 0.5
+    assert hypers["graph_attention_cutoff_function"] == "Bump"
+    assert hypers["graph_attention_bias_strength"] == 1.0
 
     repo_root = Path(__file__).parents[5]
     v37_config = OmegaConf.load(
@@ -325,8 +350,13 @@ def test_v37_hyperparameters_are_exposed_to_config_and_wrapper():
     assert v37_config.architecture.model.coord_encoder_use_checkpoint is True
     assert v37_config.architecture.model.force_readout_type == "pair_cross_attention"
     assert v37_config.architecture.model.stress_readout_type == "pair_cross_attention"
-    assert v37_config.architecture.model.pair_readout_chunk_size == 64
+    assert v37_config.architecture.model.pair_readout_chunk_size is None
     assert v37_config.architecture.model.pair_readout_include_pair_geometry is False
+    assert v37_config.architecture.model.graph_attention == "smooth_cutoff"
+    assert v37_config.architecture.model.graph_attention_cutoff == 4.5
+    assert v37_config.architecture.model.graph_attention_cutoff_width == 0.5
+    assert v37_config.architecture.model.graph_attention_cutoff_function == "Bump"
+    assert v37_config.architecture.model.graph_attention_bias_strength == 1.0
 
     hypers.update(
         _v37_kwargs(
@@ -386,5 +416,21 @@ def test_v37_rejects_index_ordering_and_double_rope():
             **_v37_kwargs(
                 force_readout_type="pair_cross_attention",
                 pair_readout_num_heads=5,
+            )
+        )
+
+    with pytest.raises(ValueError, match="graph_attention"):
+        StructureTransformer(**_v37_kwargs(graph_attention="distance"))
+
+    with pytest.raises(ValueError, match="graph_attention_bias_strength"):
+        StructureTransformer(**_v37_kwargs(graph_attention_bias_strength=-1.0))
+
+    with pytest.raises(ValueError, match="atom_ordering='none'"):
+        StructureTransformer(
+            **_v37_kwargs(
+                coordinate_encoding="absolute_mlp",
+                use_periodic_rope=False,
+                atom_ordering="position_ids",
+                graph_attention="smooth_cutoff",
             )
         )

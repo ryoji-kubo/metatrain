@@ -109,6 +109,24 @@ class ModelHypers(TypedDict):
     pair_readout_exclude_self: bool = True
     """If true, atom readout attention masks self-pairs when other atoms exist."""
 
+    graph_attention: Literal["none", "binary", "smooth_cutoff"] = "none"
+    """Optional PET-style graph prior applied as an additive attention bias."""
+
+    graph_attention_cutoff: float = 4.5
+    """Neighbor-list cutoff radius used for graph attention."""
+
+    graph_attention_cutoff_width: float = 0.5
+    """Width of the PET cutoff transition used for smooth graph attention."""
+
+    graph_attention_cutoff_function: Literal["Bump", "Cosine"] = "Bump"
+    """PET cutoff function used for smooth graph attention."""
+
+    graph_attention_bias_strength: float = 1.0
+    """Multiplier lambda on the PET-style log-cutoff attention bias."""
+
+    graph_attention_epsilon: float = 1.0e-15
+    """Minimum cutoff factor before taking log for graph attention."""
+
     direct_prediction: bool = True
     avg_num_nodes: float = 1.0
     symmetrize_stress: bool = False

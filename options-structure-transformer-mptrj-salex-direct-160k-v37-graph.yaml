@@ -1,0 +1,199 @@
+# Experimental metatrain wrapper for the equiformer_v3 direct transformer.
+# This keeps the PET trainer/data pipeline and swaps only the neural architecture:
+# - fitted energy composition baseline
+# - fitted target scales for energy/force/stress
+# - optional random rotation/inversion augmentation, enabled in this v37 config
+# - same MPtrj training data and 30k sAlex validation data
+# - direct force/stress prediction, no conservative gradients
+
+wandb:
+  project: pet-oam-mptrj
+  name: structure-transformer-metatrain-160k-v37-graph
+  entity: null
+  mode: online
+
+seed: 42
+device: cuda
+base_precision: 32
+
+architecture:
+  name: experimental.structure_transformer
+  atomic_types: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+    31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+    41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+    51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
+    61, 62, 63, 64, 65, 66, 67, 68, 69, 70,
+    71, 72, 73, 74, 75, 76, 77, 78, 79, 80,
+    81, 82, 83, 89, 90, 91, 92, 93, 94]
+  model:
+    # v37-style invariant backbone: relative torus coordinate features,
+    # integer-harmonic coordinate RoPE, and no sequence-index atom ordering.
+    max_num_elements: 128
+    embed_dim: 768
+    num_heads: 12
+    num_layers: 12
+    encoder_hidden_dim: null
+    mlp_hidden_dim: null
+    dropout: 0.05
+    attn_dropout: null
+    residual_dropout: null
+    mlp_dropout: null
+
+    position_scale: 1.0
+    position_representation: fractional
+    coordinate_encoding: v37_torus_relative
+    coord_num_harmonics: 4
+    coord_encoder_chunk_size: 128
+    coord_encoder_use_checkpoint: true
+    use_rotary_embeddings: false
+    use_periodic_rope: true
+    atom_ordering: none
+    center_positions: false
+    fractional_wrap_eps: 1.0e-6
+    atom_embedding_type: scalar
+    atomic_number_scale: 118.0
+    atom_scalar_embedding_scale: 1000.0
+    include_cell_energy: true
+    include_cell_stress: true
+
+    # Decoupled force/stress prediction heads. These add receiver-wise
+    # cross-attention over atom latents before the final vector/tensor MLPs.
+    force_readout_type: pair_cross_attention
+    stress_readout_type: pair_cross_attention
+    pair_readout_num_heads: null
+    pair_readout_hidden_dim: null
+    pair_readout_num_layers: 1
+    pair_readout_dropout: null
+    pair_readout_chunk_size: null
+    pair_readout_use_checkpoint: false
+    pair_readout_include_pair_geometry: false
+    pair_readout_exclude_self: true
+
+    # PET-style graph prior in atom-atom transformer attention.
+    # lambda=1.0 matches PET's log(cutoff) attention bias; lambda=0.0
+    # recovers the ungated all-to-all transformer attention.
+    graph_attention: smooth_cutoff
+    graph_attention_cutoff: 10.0
+    graph_attention_cutoff_width: 0.5
+    graph_attention_cutoff_function: Bump
+    graph_attention_bias_strength: 1.0
+    graph_attention_epsilon: 1.0e-15
+
+    regress_forces: true
+    regress_stress: true
+    direct_prediction: true
+    avg_num_nodes: 1.0
+    symmetrize_stress: false
+
+  training:
+    use_data_augmentation: true
+    distributed: false
+    distributed_port: 39591
+
+    batch_size: 4
+    batch_atom_bounds: [null, null]
+    max_atoms_per_batch: 512
+    min_atoms_per_batch: 0
+
+    num_epochs: 100
+    warmup_fraction: 0.1
+    learning_rate: 1.0e-4
+    weight_decay: null
+    num_workers: null
+
+    log_interval: 1
+    checkpoint_interval: 1
+    log_mae: true
+    log_separate_blocks: false
+    best_model_metric: rmse_prod
+    grad_clip_norm: 1.0
+
+    scale_targets: true
+    atomic_baseline: {}
+    fixed_scaling_weights: {}
+    per_structure_targets:
+      - non_conservative_stress
+
+    loss:
+      energy:
+        type: huber
+        weight: 1.0
+        reduction: mean
+        delta: 0.015
+      non_conservative_force:
+        type: huber
+        weight: 1.0
+        reduction: mean
+        delta: 0.04
+      non_conservative_stress:
+        type: huber
+        weight: 0.01
+        reduction: mean
+        delta: 0.004
+
+    finetune:
+      method: full
+      read_from: null
+      config: {}
+      inherit_heads: {}
+
+training_set:
+  systems:
+    read_from: data
+    length_unit: angstrom
+  targets:
+    energy:
+      key: e
+      quantity: energy
+      unit: eV
+      forces: false
+      stress: false
+    non_conservative_force:
+      key: f
+      quantity: force
+      unit: eV/A
+      sample_kind: atom
+      type:
+        cartesian:
+          rank: 1
+    non_conservative_stress:
+      key: s
+      quantity: pressure
+      unit: eV/A^3
+      sample_kind: system
+      type:
+        cartesian:
+          rank: 2
+
+validation_set:
+  systems:
+    read_from: data_salex_val_30k
+    length_unit: angstrom
+  targets:
+    energy:
+      key: e
+      quantity: energy
+      unit: eV
+      forces: false
+      stress: false
+    non_conservative_force:
+      key: f
+      quantity: force
+      unit: eV/A
+      sample_kind: atom
+      type:
+        cartesian:
+          rank: 1
+    non_conservative_stress:
+      key: s
+      quantity: pressure
+      unit: eV/A^3
+      sample_kind: system
+      type:
+        cartesian:
+          rank: 2
+
+test_set:
+  indices: []
