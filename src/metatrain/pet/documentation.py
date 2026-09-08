@@ -116,6 +116,17 @@ class ModelHypers(TypedDict):
     shift ``(0, 0, 0)``. The latter two modes are intended as ablations; in
     particular, ``"zero"`` breaks invariance to the choice of periodic image.
     """
+    geometry_mode: Literal["relative", "absolute"] = "relative"
+    """Geometric information supplied to PET's local attention tokens.
+
+    ``"relative"`` is the standard PET representation: the central token contains
+    its atomic-species embedding, while every neighbor token contains the relative
+    Cartesian edge vector and its norm. ``"absolute"`` is an ablation in which the
+    central token receives its Cartesian position and every neighbor token receives
+    the Cartesian position of the corresponding periodic image. The neighbor graph
+    and distance-dependent cutoff factors are unchanged. Unlike ``"relative"``, the
+    ``"absolute"`` representation is not translation invariant by construction.
+    """
     cutoff_function: Literal["Cosine", "Bump"] = "Bump"
     """Type of the smoothing function at the cutoff"""
     cutoff_width: float = 0.5

@@ -239,7 +239,8 @@ def _select_edges_by_cell_shift_mode(
         pair_ids.shape[0], device=pair_ids.device, dtype=torch.bool
     )
     if pair_ids.shape[0] > 1:
-        # It is the very first entry overall, or Its pair_id differs from the preceding entry.
+        # This is the first entry overall, or its pair ID differs from the
+        # preceding entry.
         first_for_pair[1:] = pair_ids[1:] != pair_ids[:-1]
     selected = representatives[first_for_pair]
     selected_with_reverse = torch.cat(
@@ -279,6 +280,8 @@ def systems_to_batch(
     torch.Tensor,
     torch.Tensor,
     Labels,
+    torch.Tensor,
+    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -338,6 +341,11 @@ def systems_to_batch(
         - `cell_shifts`: Integer cell shift vectors for each real (non-padded) edge,
           shape ``(n_edges, 3)``. Columns correspond to ``(cell_shift_a, cell_shift_b,
           cell_shift_c)``. Suitable for use with :func:`get_pair_sample_labels`.
+        - `node_positions`: Cartesian positions of the atoms, shape ``(n_atoms, 3)``.
+        - `neighbor_image_positions`: Cartesian positions of the selected periodic
+          neighbor images in NEF layout, shape ``(n_atoms, max_num_neighbors, 3)``.
+          For an edge
+          with neighbor ``j`` and cell shift ``S``, this is ``r_j + S @ cell``.
 
     """
     (
@@ -456,6 +464,11 @@ def systems_to_batch(
     element_indices_nodes = species_to_species_index[species]
     element_indices_neighbors = element_indices_nodes[neighbors]
 
+    # The absolute-coordinate ablation needs the actual Cartesian position of the
+    # selected periodic image, not the base-cell position of the neighbor. Constructing
+    # it as center + edge vector keeps it consistent with all preceding edge filters.
+    neighbor_image_positions = positions.index_select(0, centers) + edge_vectors
+
     # Send everything to NEF:
     edge_vectors = edge_array_to_nef(edge_vectors, nef_indices)
     edge_distances = torch.sqrt(torch.sum(edge_vectors**2, dim=2) + 1e-15)
@@ -463,6 +476,9 @@ def systems_to_batch(
         element_indices_neighbors, nef_indices
     )
     cutoff_factors = edge_array_to_nef(cutoff_factors, nef_indices, nef_mask, 0.0)
+    neighbor_image_positions = edge_array_to_nef(
+        neighbor_image_positions, nef_indices, nef_mask, 0.0
+    )
 
     corresponding_edges = get_corresponding_edges(centers, neighbors, cell_shifts)
 
@@ -506,4 +522,6 @@ def systems_to_batch(
         neighbors,
         nef_to_edges_neighbor,
         cell_shifts,
+        positions,
+        neighbor_image_positions,
     )

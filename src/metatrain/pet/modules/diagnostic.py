@@ -15,6 +15,8 @@ FEATURIZER_INPUT_NAMES: Set[str] = {
     "element_indices_neighbors",
     "edge_vectors",
     "edge_distances",
+    "node_positions",
+    "neighbor_image_positions",
     "reverse_neighbor_index",
     "padding_mask",
     "cutoff_factors",
@@ -117,6 +119,8 @@ def standardize_featurizer_input_tensor(
         * padding_mask: (n_atoms, max_nbrs) -> (n_atoms, max_nbrs, 1)`` float  [edge]
         * cutoff_factors: (n_atoms, max_nbrs) -> (n_atoms, max_nbrs, 1)``  [edge]
         * edge_vectors: already in the correct shape (n_atoms, max_nbrs, 3)
+        * node_positions: already in the correct shape (n_atoms, 3)
+        * neighbor_image_positions: already in the correct shape (n_atoms, max_nbrs, 3)
 
     :param name: the featurizer-input name.
     :param tensor: the raw tensor from ``systems_to_batch``.
@@ -129,7 +133,7 @@ def standardize_featurizer_input_tensor(
     elif name == "element_indices_neighbors":
         return tensor.unsqueeze(-1).float()
 
-    elif name == "edge_vectors":
+    elif name in ["edge_vectors", "node_positions", "neighbor_image_positions"]:
         return tensor
 
     elif name == "edge_distances":

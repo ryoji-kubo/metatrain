@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -372,6 +372,9 @@ class CartesianTransformer(torch.nn.Module):
     :param transformer_type: The type of transformer, either "PostLN" or "PreLN".
     :param n_atomic_species: The number of atomic species.
     :param is_first: Whether this is the first transformer in the model.
+    :param geometry_mode: Geometric token representation. ``"relative"`` uses the
+        standard relative edge vector and distance. ``"absolute"`` uses the central
+        position and the Cartesian position of each periodic neighbor image.
     """
 
     def __init__(
@@ -389,9 +392,16 @@ class CartesianTransformer(torch.nn.Module):
         transformer_type: str,
         n_atomic_species: int,
         is_first: bool,
+        geometry_mode: str = "relative",
     ) -> None:
         super(CartesianTransformer, self).__init__()
         self.is_first = is_first
+        self.geometry_mode = geometry_mode
+        if self.geometry_mode not in ["relative", "absolute"]:
+            raise ValueError(
+                "geometry_mode must be 'relative' or 'absolute', got "
+                + self.geometry_mode
+            )
         self.cutoff = cutoff
         self.cutoff_width = cutoff_width
         self.trans = Transformer(
@@ -406,7 +416,12 @@ class CartesianTransformer(torch.nn.Module):
             attention_temperature=attention_temperature,
         )
 
-        self.edge_embedder = nn.Linear(4, d_model)
+        self.node_position_embedder = DummyModule()
+        if self.geometry_mode == "absolute":
+            self.node_position_embedder = nn.Linear(3, dim_node_features)
+            self.edge_embedder = nn.Linear(3, d_model)
+        else:
+            self.edge_embedder = nn.Linear(4, d_model)
 
         if not is_first:
             n_merge = 3
@@ -433,6 +448,8 @@ class CartesianTransformer(torch.nn.Module):
         edge_distances: torch.Tensor,
         cutoff_factors: torch.Tensor,
         use_manual_attention: bool,
+        node_positions: Optional[torch.Tensor] = None,
+        neighbor_image_positions: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass for the CartesianTransformer.
@@ -455,18 +472,35 @@ class CartesianTransformer(torch.nn.Module):
             (which supports double backward, needed for training with conservative
             forces), or the built-in PyTorch attention (which does not support double
             backward).
+        :param node_positions: Cartesian positions of the central atoms, shape
+            ``(n_nodes, 3)``. Required in ``"absolute"`` mode.
+        :param neighbor_image_positions: Cartesian positions of the selected periodic
+            neighbor images in NEF layout, shape
+            ``(n_nodes, max_num_neighbors, 3)``. Required
+            in ``"absolute"`` mode.
         :return: A tuple containing:
             - The output node embeddings, of shape (n_nodes, d_model)
             - The output edge embeddings, of shape (n_nodes, max_num_neighbors, d_model)
         """
-        node_embeddings = input_node_embeddings
-        edge_embeddings = [edge_vectors, edge_distances[:, :, None]]
+        if self.geometry_mode == "absolute":
+            if node_positions is None or neighbor_image_positions is None:
+                raise ValueError(
+                    "node_positions and neighbor_image_positions are required "
+                    "in absolute geometry mode"
+                )
+            node_embeddings = input_node_embeddings + self.node_position_embedder(
+                node_positions
+            )
+            edge_geometry = neighbor_image_positions
+        else:
+            node_embeddings = input_node_embeddings
+            edge_geometry_parts = [edge_vectors, edge_distances[:, :, None]]
 
-        # on some systems, on isolated atoms, a torchscript bug concatenates the two
-        # (empty) float tensors into an int tensors, causing an error later on
-        edge_embeddings = torch.cat(edge_embeddings, dim=2).to(edge_vectors.dtype)
+            # On some systems, for isolated atoms, a TorchScript bug concatenates the
+            # two empty floating-point tensors into an integer tensor.
+            edge_geometry = torch.cat(edge_geometry_parts, dim=2).to(edge_vectors.dtype)
 
-        edge_embeddings = self.edge_embedder(edge_embeddings)
+        edge_embeddings = self.edge_embedder(edge_geometry)
 
         if not self.is_first:
             neighbor_elements_embeddings = self.neighbor_embedder(

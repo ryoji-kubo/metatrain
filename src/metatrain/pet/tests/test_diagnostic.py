@@ -284,6 +284,8 @@ def test_gnn_layer_edge_output():
     "input_name",
     [
         "edge_vectors",
+        "node_positions",
+        "neighbor_image_positions",
         "padding_mask",
         "element_indices_neighbors",
         "cutoff_factors",

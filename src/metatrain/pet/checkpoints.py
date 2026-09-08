@@ -302,6 +302,18 @@ def model_update_v13_v14(checkpoint: dict) -> None:
         checkpoint["model_data"]["model_hypers"]["neighbor_cell_shift_mode"] = "all"
 
 
+def model_update_v14_v15(checkpoint: dict) -> None:
+    """Update a v14 checkpoint to v15.
+
+    Existing PET checkpoints use the standard relative edge representation. Pin them
+    to ``"relative"`` when introducing the absolute-coordinate ablation.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    if "geometry_mode" not in checkpoint["model_data"]["model_hypers"]:
+        checkpoint["model_data"]["model_hypers"]["geometry_mode"] = "relative"
+
+
 ###########################
 # TRAINER #################
 ###########################
