@@ -25,7 +25,7 @@ architecture:
     num_neighbors_adaptive: 40
     adaptive_cutoff_method: grid
     # Periodic-image ablation: all (standard PET), nearest, or zero.
-    neighbor_cell_shift_mode: all
+    neighbor_cell_shift_mode: nearest
     cutoff_function: Bump
     cutoff_width: 0.5
 
@@ -59,7 +59,7 @@ architecture:
     max_atoms_per_batch: 512
     min_atoms_per_batch: 0
 
-    num_epochs: 5
+    num_epochs: 50
     warmup_fraction: 0.1
     learning_rate: 1.0e-4
     weight_decay: null

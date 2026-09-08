@@ -44,6 +44,9 @@ from .modules.transformer import CartesianTransformer
 
 
 AVAILABLE_FEATURIZERS = typing.get_args(ModelHypers.__annotations__["featurizer_type"])
+AVAILABLE_NEIGHBOR_CELL_SHIFT_MODES = typing.get_args(
+    ModelHypers.__annotations__["neighbor_cell_shift_mode"]
+)
 
 
 class PET(ModelInterface[ModelHypers]):
@@ -58,7 +61,7 @@ class PET(ModelInterface[ModelHypers]):
         targets.
     """
 
-    __checkpoint_version__ = 13
+    __checkpoint_version__ = 14
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -80,6 +83,13 @@ class PET(ModelInterface[ModelHypers]):
             else None
         )
         self.adaptive_cutoff_method = self.hypers["adaptive_cutoff_method"]
+        self.neighbor_cell_shift_mode = self.hypers["neighbor_cell_shift_mode"]
+        if self.neighbor_cell_shift_mode not in AVAILABLE_NEIGHBOR_CELL_SHIFT_MODES:
+            raise ValueError(
+                f"Unknown neighbor cell shift mode: {self.neighbor_cell_shift_mode}. "
+                "Available options are: "
+                f"{AVAILABLE_NEIGHBOR_CELL_SHIFT_MODES}"
+            )
         self.d_pet = self.hypers["d_pet"]
         self.d_node = self.hypers["d_node"]
         self.d_head = self.hypers["d_head"]
@@ -479,6 +489,7 @@ class PET(ModelInterface[ModelHypers]):
                 self.cutoff_width,
                 self.num_neighbors_adaptive,
                 self.adaptive_cutoff_method,
+                self.neighbor_cell_shift_mode,
             )
 
         # ===== BEGIN DIAGNOSTIC-RELATED BLOCK

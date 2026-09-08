@@ -107,6 +107,15 @@ class ModelHypers(TypedDict):
     a Newton-bisection root finder (default; faster and more accurate). Only
     has effect when ``num_neighbors_adaptive`` is set.
     """
+    neighbor_cell_shift_mode: Literal["all", "nearest", "zero"] = "all"
+    """Periodic neighbor images exposed to PET.
+
+    ``"all"`` retains the standard periodic neighbor list. ``"nearest"`` retains
+    only the nearest reverse-closed periodic interaction for each unordered pair of
+    atoms in the base cell. ``"zero"`` retains only neighbor-list edges with cell
+    shift ``(0, 0, 0)``. The latter two modes are intended as ablations; in
+    particular, ``"zero"`` breaks invariance to the choice of periodic image.
+    """
     cutoff_function: Literal["Cosine", "Bump"] = "Bump"
     """Type of the smoothing function at the cutoff"""
     cutoff_width: float = 0.5

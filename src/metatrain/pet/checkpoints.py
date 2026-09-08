@@ -290,6 +290,18 @@ def model_update_v12_v13(checkpoint: dict) -> None:
     update_per_property_scales(checkpoint)
 
 
+def model_update_v13_v14(checkpoint: dict) -> None:
+    """Update a v13 checkpoint to v14.
+
+    Existing PET checkpoints used the complete periodic neighbor list, which is the
+    ``"all"`` behavior introduced in v14.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    if "neighbor_cell_shift_mode" not in checkpoint["model_data"]["model_hypers"]:
+        checkpoint["model_data"]["model_hypers"]["neighbor_cell_shift_mode"] = "all"
+
+
 ###########################
 # TRAINER #################
 ###########################
