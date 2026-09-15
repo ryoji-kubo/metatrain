@@ -1,0 +1,2 @@
+# Keep the small, prepared notebook input despite the root *.pt rule.
+!pet_input.pt

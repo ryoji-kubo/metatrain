@@ -44,6 +44,10 @@ from .modules.transformer import CartesianTransformer
 
 
 AVAILABLE_FEATURIZERS = typing.get_args(ModelHypers.__annotations__["featurizer_type"])
+AVAILABLE_NEIGHBOR_CELL_SHIFT_MODES = typing.get_args(
+    ModelHypers.__annotations__["neighbor_cell_shift_mode"]
+)
+AVAILABLE_GEOMETRY_MODES = typing.get_args(ModelHypers.__annotations__["geometry_mode"])
 
 
 class PET(ModelInterface[ModelHypers]):
@@ -58,7 +62,7 @@ class PET(ModelInterface[ModelHypers]):
         targets.
     """
 
-    __checkpoint_version__ = 13
+    __checkpoint_version__ = 15
     __supported_devices__ = ["cuda", "cpu"]
     __supported_dtypes__ = [torch.float32, torch.float64]
     __default_metadata__ = ModelMetadata(
@@ -80,6 +84,19 @@ class PET(ModelInterface[ModelHypers]):
             else None
         )
         self.adaptive_cutoff_method = self.hypers["adaptive_cutoff_method"]
+        self.neighbor_cell_shift_mode = self.hypers["neighbor_cell_shift_mode"]
+        if self.neighbor_cell_shift_mode not in AVAILABLE_NEIGHBOR_CELL_SHIFT_MODES:
+            raise ValueError(
+                f"Unknown neighbor cell shift mode: {self.neighbor_cell_shift_mode}. "
+                "Available options are: "
+                f"{AVAILABLE_NEIGHBOR_CELL_SHIFT_MODES}"
+            )
+        self.geometry_mode = self.hypers["geometry_mode"]
+        if self.geometry_mode not in AVAILABLE_GEOMETRY_MODES:
+            raise ValueError(
+                f"Unknown geometry mode: {self.geometry_mode}. Available options are: "
+                f"{AVAILABLE_GEOMETRY_MODES}"
+            )
         self.d_pet = self.hypers["d_pet"]
         self.d_node = self.hypers["d_node"]
         self.d_head = self.hypers["d_head"]
@@ -116,6 +133,7 @@ class PET(ModelInterface[ModelHypers]):
                     self.transformer_type,
                     num_atomic_species,
                     layer_index == 0,  # is first layer
+                    self.geometry_mode,
                 )
                 for layer_index in range(self.num_gnn_layers)
             ]
@@ -351,6 +369,9 @@ class PET(ModelInterface[ModelHypers]):
           neighboring atoms
         - `edge_vectors` [n_atoms, max_num_neighbors, 3]: Cartesian edge vectors
           between central atoms and their neighbors
+        - `node_positions` [n_atoms, 3]: Cartesian positions of central atoms
+        - `neighbor_image_positions` [n_atoms, max_num_neighbors, 3]: Cartesian
+          positions of the selected periodic neighbor images
         - `padding_mask` [n_atoms, max_num_neighbors]: Mask indicating real vs padded
           neighbors
         - `reverse_neighbor_index` [n_atoms * max_num_neighbors]: Index of the ji edge
@@ -470,6 +491,8 @@ class PET(ModelInterface[ModelHypers]):
                 neighbors,
                 nef_to_edges_neighbor,
                 cell_shifts,
+                node_positions,
+                neighbor_image_positions,
             ) = systems_to_batch(
                 systems,
                 nl_options,
@@ -479,6 +502,7 @@ class PET(ModelInterface[ModelHypers]):
                 self.cutoff_width,
                 self.num_neighbors_adaptive,
                 self.adaptive_cutoff_method,
+                self.neighbor_cell_shift_mode,
             )
 
         # ===== BEGIN DIAGNOSTIC-RELATED BLOCK
@@ -513,7 +537,10 @@ class PET(ModelInterface[ModelHypers]):
 
         # the scaled_dot_product_attention function from torch cannot do
         # double backward, so we will use manual attention if needed
-        use_manual_attention = edge_vectors.requires_grad and self.training
+        positions_require_grad = (
+            edge_vectors.requires_grad or node_positions.requires_grad
+        )
+        use_manual_attention = positions_require_grad and self.training
 
         with torch.profiler.record_function("PET::_calculate_features"):
             # **Stage 1: Feature Computation via GNN Layers**
@@ -522,6 +549,8 @@ class PET(ModelInterface[ModelHypers]):
                 element_indices_neighbors=element_indices_neighbors,
                 edge_vectors=edge_vectors,
                 edge_distances=edge_distances,
+                node_positions=node_positions,
+                neighbor_image_positions=neighbor_image_positions,
                 reverse_neighbor_index=reverse_neighbor_index,
                 padding_mask=padding_mask,
                 cutoff_factors=cutoff_factors,
@@ -811,6 +840,8 @@ class PET(ModelInterface[ModelHypers]):
                 inputs["edge_distances"],
                 inputs["cutoff_factors"],
                 use_manual_attention,
+                inputs["node_positions"],
+                inputs["neighbor_image_positions"],
             )
 
             # The GNN contraction happens by reordering the messages,
@@ -879,6 +910,8 @@ class PET(ModelInterface[ModelHypers]):
                 inputs["edge_distances"],
                 inputs["cutoff_factors"],
                 use_manual_attention,
+                inputs["node_positions"],
+                inputs["neighbor_image_positions"],
             )
             node_features_list.append(output_node_embeddings)
             edge_features_list.append(output_edge_embeddings)

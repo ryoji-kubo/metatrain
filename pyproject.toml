@@ -70,6 +70,7 @@ soap-bpnn = [
     "wigners",
 ]
 pet = []
+gent = []
 gap = [
     "featomic-torch >=0.7.4,<0.8",
     "skmatter",
@@ -141,7 +142,7 @@ ignore = ["B018", "B904"]
 
 [tool.ruff.lint.isort]
 lines-after-imports = 2
-known-first-party = ["metatrain"]
+known-first-party = ["gent_core", "metatrain", "structure_transformer_core"]
 known-third-party = ["torch"]
 
 [tool.ruff.format]

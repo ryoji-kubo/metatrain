@@ -166,9 +166,12 @@ class Trainer(TrainerInterface[TrainerHypers]):
         dataset_info = model.dataset_info
         train_targets = dataset_info.targets
         extra_data_info = dataset_info.extra_data
-        rotational_augmenter = RotationalAugmenter(
-            target_info_dict=train_targets, extra_data_info_dict=extra_data_info
-        )
+        use_data_augmentation = self.hypers.get("use_data_augmentation", True)
+        rotational_augmenter: Optional[RotationalAugmenter] = None
+        if use_data_augmentation:
+            rotational_augmenter = RotationalAugmenter(
+                target_info_dict=train_targets, extra_data_info_dict=extra_data_info
+            )
         requested_neighbor_lists = get_requested_neighbor_lists(model)
         max_atoms = self.hypers["max_atoms_per_batch"]
         # When max_atoms_per_batch is set, batches are pre-filtered by atom count at
@@ -244,15 +247,19 @@ class Trainer(TrainerInterface[TrainerHypers]):
         model.scaler.scales_to(device=device, dtype=torch.float64)
 
         # Create collate functions:
-        collate_fn_train = CollateFn(
-            target_keys=list(train_targets.keys()),
-            callables=[
-                atomic_basis_transform,
-                rotational_augmenter.apply_random_augmentations,
+        train_callables = [atomic_basis_transform]
+        if rotational_augmenter is not None:
+            train_callables.append(rotational_augmenter.apply_random_augmentations)
+        train_callables.extend(
+            [
                 get_system_with_neighbor_lists_transform(requested_neighbor_lists),
                 get_remove_additive_transform(additive_models, train_targets),
                 get_remove_scale_transform(scaler),
-            ],
+            ]
+        )
+        collate_fn_train = CollateFn(
+            target_keys=list(train_targets.keys()),
+            callables=train_callables,
             batch_atom_bounds=batch_atom_bounds,
         )
         collate_fn_val = CollateFn(

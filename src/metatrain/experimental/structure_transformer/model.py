@@ -21,8 +21,10 @@ from metatrain.utils.dtype import dtype_to_str
 from metatrain.utils.metadata import merge_metadata
 from metatrain.utils.scaler import Scaler
 
+from structure_transformer_core import StructureTransformer, TransformerData
+from structure_transformer_core.graph_attention import build_dense_graph_attention_bias
+
 from .documentation import ModelHypers
-from .modules.transformer import StructureTransformer, TransformerData
 
 
 class StructureTransformerModel(ModelInterface[ModelHypers]):
@@ -54,14 +56,34 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
         transformer_hypers.pop("symmetrize_stress", None)
         self.transformer = StructureTransformer(**transformer_hypers)
         self.edge_vector_head = self.transformer.edge_vector_head
+        self.graph_attention = self.transformer.graph_attention
+        self.uses_graph_attention = (
+            self.graph_attention != "none"
+            and self.transformer.graph_attention_bias_strength > 0.0
+        )
         edge_vector_head_cutoff = (
             self.transformer.edge_vector_head_cutoff if self.edge_vector_head else 1.0
         )
-        self.requested_nl = NeighborListOptions(
+        graph_attention_cutoff = (
+            self.transformer.graph_attention_cutoff if self.uses_graph_attention else 1.0
+        )
+        self.edge_requested_nl = NeighborListOptions(
             cutoff=edge_vector_head_cutoff,
             full_list=True,
             strict=True,
         )
+        if self.edge_vector_head and self.uses_graph_attention and (
+            graph_attention_cutoff == edge_vector_head_cutoff
+        ):
+            self.graph_requested_nl = self.edge_requested_nl
+        else:
+            self.graph_requested_nl = NeighborListOptions(
+                cutoff=graph_attention_cutoff,
+                full_list=True,
+                strict=True,
+            )
+        # Backwards-compatible alias used by the edge-vector helper path.
+        self.requested_nl = self.edge_requested_nl
 
         self.outputs: Dict[str, ModelOutput] = {}
         self._target_to_raw_output: Dict[str, str] = {}
@@ -131,13 +153,20 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
         )
 
     def requested_neighbor_lists(self) -> List[NeighborListOptions]:
+        requested: List[NeighborListOptions] = []
         if self.edge_vector_head:
-            return [self.requested_nl]
+            requested.append(self.edge_requested_nl)
+        if self.uses_graph_attention:
+            if (
+                not self.edge_vector_head
+                or self.graph_requested_nl.cutoff != self.edge_requested_nl.cutoff
+            ):
+                requested.append(self.graph_requested_nl)
 
         # The copied transformer is a global sequence model and, by default, does not
         # consume local neighbor lists. Returning an empty list lets the PET trainer
         # keep the same collate stack while avoiding unnecessary neighbor construction.
-        return []
+        return requested
 
     def supported_outputs(self) -> Dict[str, ModelOutput]:
         return self.outputs
@@ -208,7 +237,7 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
         edge_neighbors_list: List[torch.Tensor] = []
         atom_offset = 0
         for system in systems:
-            neighbor_list = system.get_neighbor_list(self.requested_nl)
+            neighbor_list = system.get_neighbor_list(self.edge_requested_nl)
             samples = neighbor_list.samples.values.to(device=device, dtype=torch.long)
             edge_vectors = neighbor_list.values.squeeze(-1).to(
                 device=device,
@@ -223,6 +252,77 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
             torch.cat(edge_vectors_list, dim=0),
             torch.cat(edge_centers_list, dim=0),
             torch.cat(edge_neighbors_list, dim=0),
+        )
+
+    def _systems_to_graph_attention_bias(self, systems: List[System]) -> torch.Tensor:
+        device = systems[0].positions.device
+        dtype = systems[0].positions.dtype
+
+        atom_counts = torch.tensor(
+            [len(system) for system in systems],
+            device=device,
+            dtype=torch.long,
+        )
+        batch = torch.repeat_interleave(
+            torch.arange(len(systems), device=device, dtype=torch.long),
+            atom_counts,
+        )
+
+        edge_centers_list: List[torch.Tensor] = []
+        edge_neighbors_list: List[torch.Tensor] = []
+        edge_distances_list: List[torch.Tensor] = []
+        atom_offset = 0
+        for system in systems:
+            num_atoms = len(system)
+            neighbor_list = system.get_neighbor_list(self.graph_requested_nl)
+            samples = neighbor_list.samples.values.to(device=device, dtype=torch.long)
+            if samples.numel() > 0:
+                edge_vectors = neighbor_list.values.squeeze(-1).to(
+                    device=device,
+                    dtype=dtype,
+                )
+                edge_centers_list.append(samples[:, 0] + atom_offset)
+                edge_neighbors_list.append(samples[:, 1] + atom_offset)
+                edge_distances_list.append(torch.linalg.norm(edge_vectors, dim=-1))
+            atom_offset += num_atoms
+
+        if edge_centers_list:
+            centers = torch.cat(edge_centers_list, dim=0)
+            neighbors = torch.cat(edge_neighbors_list, dim=0)
+            edge_distances = torch.cat(edge_distances_list, dim=0)
+        else:
+            centers = torch.empty(0, device=device, dtype=torch.long)
+            neighbors = torch.empty(0, device=device, dtype=torch.long)
+            edge_distances = torch.empty(0, device=device, dtype=dtype)
+
+        return build_dense_graph_attention_bias(
+            centers,
+            neighbors,
+            edge_distances,
+            batch,
+            batch_size=len(systems),
+            max_atoms=(
+                int(atom_counts.max().item()) if atom_counts.numel() > 0 else 0
+            ),
+            atom_counts=atom_counts,
+            graph_attention=self.graph_attention,
+            graph_attention_cutoff=self.transformer.graph_attention_cutoff,
+            graph_attention_num_neighbors_adaptive=(
+                self.transformer.graph_attention_num_neighbors_adaptive
+            ),
+            graph_attention_adaptive_cutoff_method=(
+                self.transformer.graph_attention_adaptive_cutoff_method
+            ),
+            graph_attention_cutoff_width=(
+                self.transformer.graph_attention_cutoff_width
+            ),
+            graph_attention_cutoff_function=(
+                self.transformer.graph_attention_cutoff_function
+            ),
+            graph_attention_bias_strength=(
+                self.transformer.graph_attention_bias_strength
+            ),
+            graph_attention_epsilon=self.transformer.graph_attention_epsilon,
         )
 
     def _system_samples(self, systems: List[System], device: torch.device) -> Labels:
@@ -327,6 +427,10 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
         selected_atoms: Optional[Labels] = None,
     ) -> Dict[str, TensorMap]:
         data = self._systems_to_transformer_data(systems)
+        graph_attention_bias: Optional[torch.Tensor] = None
+        if self.uses_graph_attention:
+            graph_attention_bias = self._systems_to_graph_attention_bias(systems)
+
         if self.edge_vector_head:
             edge_vectors, edge_centers, edge_neighbors = self._systems_to_edge_data(
                 systems
@@ -336,9 +440,13 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
                 edge_vectors=edge_vectors,
                 edge_centers=edge_centers,
                 edge_neighbors=edge_neighbors,
+                graph_attention_bias=graph_attention_bias,
             )
         else:
-            raw_outputs = self.transformer(data)
+            raw_outputs = self.transformer(
+                data,
+                graph_attention_bias=graph_attention_bias,
+            )
         return_dict = self._raw_outputs_to_tensormaps(
             systems, raw_outputs, outputs, selected_atoms
         )

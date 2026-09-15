@@ -107,6 +107,26 @@ class ModelHypers(TypedDict):
     a Newton-bisection root finder (default; faster and more accurate). Only
     has effect when ``num_neighbors_adaptive`` is set.
     """
+    neighbor_cell_shift_mode: Literal["all", "nearest", "zero"] = "all"
+    """Periodic neighbor images exposed to PET.
+
+    ``"all"`` retains the standard periodic neighbor list. ``"nearest"`` retains
+    only the nearest reverse-closed periodic interaction for each unordered pair of
+    atoms in the base cell. ``"zero"`` retains only neighbor-list edges with cell
+    shift ``(0, 0, 0)``. The latter two modes are intended as ablations; in
+    particular, ``"zero"`` breaks invariance to the choice of periodic image.
+    """
+    geometry_mode: Literal["relative", "absolute"] = "relative"
+    """Geometric information supplied to PET's local attention tokens.
+
+    ``"relative"`` is the standard PET representation: the central token contains
+    its atomic-species embedding, while every neighbor token contains the relative
+    Cartesian edge vector and its norm. ``"absolute"`` is an ablation in which the
+    central token receives its Cartesian position and every neighbor token receives
+    the Cartesian position of the corresponding periodic image. The neighbor graph
+    and distance-dependent cutoff factors are unchanged. Unlike ``"relative"``, the
+    ``"absolute"`` representation is not translation invariant by construction.
+    """
     cutoff_function: Literal["Cosine", "Bump"] = "Bump"
     """Type of the smoothing function at the cutoff"""
     cutoff_width: float = 0.5
@@ -180,6 +200,11 @@ class TrainerHypers(TypedDict):
     memory."""
     num_epochs: int = 1000
     """Number of epochs."""
+    use_data_augmentation: bool = True
+    """If true, apply random rotation/inversion augmentation to training batches.
+
+    Validation batches are never augmented.
+    """
     warmup_fraction: float = 0.01
     """Fraction of training steps used for learning rate warmup."""
     learning_rate: float = 1e-4

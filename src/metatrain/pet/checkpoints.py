@@ -290,6 +290,30 @@ def model_update_v12_v13(checkpoint: dict) -> None:
     update_per_property_scales(checkpoint)
 
 
+def model_update_v13_v14(checkpoint: dict) -> None:
+    """Update a v13 checkpoint to v14.
+
+    Existing PET checkpoints used the complete periodic neighbor list, which is the
+    ``"all"`` behavior introduced in v14.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    if "neighbor_cell_shift_mode" not in checkpoint["model_data"]["model_hypers"]:
+        checkpoint["model_data"]["model_hypers"]["neighbor_cell_shift_mode"] = "all"
+
+
+def model_update_v14_v15(checkpoint: dict) -> None:
+    """Update a v14 checkpoint to v15.
+
+    Existing PET checkpoints use the standard relative edge representation. Pin them
+    to ``"relative"`` when introducing the absolute-coordinate ablation.
+
+    :param checkpoint: The checkpoint to update.
+    """
+    if "geometry_mode" not in checkpoint["model_data"]["model_hypers"]:
+        checkpoint["model_data"]["model_hypers"]["geometry_mode"] = "relative"
+
+
 ###########################
 # TRAINER #################
 ###########################

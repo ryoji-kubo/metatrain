@@ -165,6 +165,101 @@ def concatenate_structures(
     )
 
 
+def _select_edges_by_cell_shift_mode(
+    centers: torch.Tensor,
+    neighbors: torch.Tensor,
+    cell_shifts: torch.Tensor,
+    edge_distances: torch.Tensor,
+    num_nodes: int,
+    mode: str,
+) -> torch.Tensor:
+    """Select periodic neighbor-list edges for a PET ablation.
+
+    ``nearest`` selects one reverse-closed interaction per unordered base-atom
+    pair. Keeping both directions is required by PET's edge-message exchange.
+    Consequently, a periodic self interaction keeps the nearest ``+shift`` and
+    ``-shift`` pair, rather than a single directed edge.
+    """
+    mode = mode.lower()
+    edge_indices = torch.arange(
+        centers.shape[0], device=centers.device, dtype=torch.long
+    )
+    if mode == "all":
+        return edge_indices
+    if mode == "zero":
+        return torch.nonzero(torch.all(cell_shifts == 0, dim=1)).squeeze(-1)
+    if mode != "nearest":
+        raise ValueError(
+            "neighbor_cell_shift_mode must be 'all', 'nearest', or 'zero', got "
+            + mode
+        )
+    if edge_indices.numel() == 0:
+        return edge_indices
+
+    # Work with one representative of every pair of reversed edges. Selecting
+    # representatives first and restoring their partners after the minimum-distance
+    # reduction guarantees that the filtered neighbor list remains reverse-closed.
+    corresponding_edges = get_corresponding_edges(centers, neighbors, cell_shifts)
+    representatives = torch.nonzero(edge_indices <= corresponding_edges).squeeze(-1)
+
+    representative_centers = centers.index_select(0, representatives)
+    representative_neighbors = neighbors.index_select(0, representatives)
+    lower = torch.minimum(representative_centers, representative_neighbors)
+    upper = torch.maximum(representative_centers, representative_neighbors)
+    pair_ids = lower * num_nodes + upper
+    representative_distances = edge_distances.index_select(0, representatives)
+
+    # Stable sorting by distance and then by pair id leaves the shortest edge first
+    # within each base-atom pair. Original edge order is the deterministic tie-break.
+    '''
+    First sort by distance
+    pair_id  distance
+    7        0.6
+    7        0.8
+    3        0.9
+    3        1.2
+    7        1.4
+
+    Then sort by pair id
+    pair_id  distance
+    3        0.9   <- first and shortest for pair 3
+    3        1.2
+    7        0.6   <- first and shortest for pair 7
+    7        0.8
+    7        1.4
+    '''
+    distance_order = torch.argsort(representative_distances, stable=True)
+    representatives = representatives.index_select(0, distance_order)
+    pair_ids = pair_ids.index_select(0, distance_order)
+    pair_order = torch.argsort(pair_ids, stable=True)
+    representatives = representatives.index_select(0, pair_order)
+    pair_ids = pair_ids.index_select(0, pair_order)
+
+    first_for_pair = torch.ones(
+        pair_ids.shape[0], device=pair_ids.device, dtype=torch.bool
+    )
+    if pair_ids.shape[0] > 1:
+        # This is the first entry overall, or its pair ID differs from the
+        # preceding entry.
+        first_for_pair[1:] = pair_ids[1:] != pair_ids[:-1]
+    selected = representatives[first_for_pair]
+    selected_with_reverse = torch.cat(
+        [selected, corresponding_edges.index_select(0, selected)]
+    )
+
+    # Restore the original neighbor-list order and remove a possible duplicate for a
+    # self-reversing edge (normally only the excluded zero-shift self edge).
+    selected_with_reverse = torch.sort(selected_with_reverse).values
+    unique = torch.ones(
+        selected_with_reverse.shape[0],
+        device=selected_with_reverse.device,
+        dtype=torch.bool,
+    )
+    if selected_with_reverse.shape[0] > 1:
+        unique[1:] = selected_with_reverse[1:] != selected_with_reverse[:-1]
+    return selected_with_reverse[unique]
+
+
 def systems_to_batch(
     systems: List[System],
     options: NeighborListOptions,
@@ -174,6 +269,7 @@ def systems_to_batch(
     cutoff_width: float,
     num_neighbors_adaptive: Optional[float] = None,
     adaptive_cutoff_method: str = "solver",
+    neighbor_cell_shift_mode: str = "all",
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -184,6 +280,8 @@ def systems_to_batch(
     torch.Tensor,
     torch.Tensor,
     Labels,
+    torch.Tensor,
+    torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -207,6 +305,11 @@ def systems_to_batch(
         cutoffs when ``num_neighbors_adaptive`` is set. ``"grid"`` uses the legacy
         probe-grid + Gaussian-weighted average; ``"solver"`` uses a Newton-bisection
         root finder on the smoothed neighbor count.
+    :param neighbor_cell_shift_mode: Periodic-image ablation applied before adaptive
+        cutoff selection. ``"all"`` keeps the complete periodic neighbor list,
+        ``"nearest"`` keeps the nearest reverse-closed image for each unordered
+        base-atom pair, and ``"zero"`` keeps only edges whose integer cell shift is
+        zero.
     :return: A tuple containing the batch tensors.
         The batch consists of the following tensors:
         - `element_indices_nodes`: The atomic species of the central atoms
@@ -238,6 +341,11 @@ def systems_to_batch(
         - `cell_shifts`: Integer cell shift vectors for each real (non-padded) edge,
           shape ``(n_edges, 3)``. Columns correspond to ``(cell_shift_a, cell_shift_b,
           cell_shift_c)``. Suitable for use with :func:`get_pair_sample_labels`.
+        - `node_positions`: Cartesian positions of the atoms, shape ``(n_atoms, 3)``.
+        - `neighbor_image_positions`: Cartesian positions of the selected periodic
+          neighbor images in NEF layout, shape ``(n_atoms, max_num_neighbors, 3)``.
+          For an edge
+          with neighbor ``j`` and cell shift ``S``, this is ``r_j + S @ cell``.
 
     """
     (
@@ -264,8 +372,22 @@ def systems_to_batch(
         )
     edge_vectors = positions[neighbors] - positions[centers] + cell_contributions
     edge_distances = torch.norm(edge_vectors, dim=-1) + 1e-15
-
     num_nodes = len(positions)
+
+    if neighbor_cell_shift_mode.lower() != "all":
+        keep = _select_edges_by_cell_shift_mode(
+            centers,
+            neighbors,
+            cell_shifts,
+            edge_distances,
+            num_nodes,
+            neighbor_cell_shift_mode,
+        )
+        centers = centers.index_select(0, keep)
+        neighbors = neighbors.index_select(0, keep)
+        cell_shifts = cell_shifts.index_select(0, keep)
+        edge_vectors = edge_vectors.index_select(0, keep)
+        edge_distances = edge_distances.index_select(0, keep)
 
     if num_neighbors_adaptive is not None:
         with torch.profiler.record_function("PET::get_adaptive_cutoffs"):
@@ -342,6 +464,11 @@ def systems_to_batch(
     element_indices_nodes = species_to_species_index[species]
     element_indices_neighbors = element_indices_nodes[neighbors]
 
+    # The absolute-coordinate ablation needs the actual Cartesian position of the
+    # selected periodic image, not the base-cell position of the neighbor. Constructing
+    # it as center + edge vector keeps it consistent with all preceding edge filters.
+    neighbor_image_positions = positions.index_select(0, centers) + edge_vectors
+
     # Send everything to NEF:
     edge_vectors = edge_array_to_nef(edge_vectors, nef_indices)
     edge_distances = torch.sqrt(torch.sum(edge_vectors**2, dim=2) + 1e-15)
@@ -349,6 +476,9 @@ def systems_to_batch(
         element_indices_neighbors, nef_indices
     )
     cutoff_factors = edge_array_to_nef(cutoff_factors, nef_indices, nef_mask, 0.0)
+    neighbor_image_positions = edge_array_to_nef(
+        neighbor_image_positions, nef_indices, nef_mask, 0.0
+    )
 
     corresponding_edges = get_corresponding_edges(centers, neighbors, cell_shifts)
 
@@ -392,4 +522,6 @@ def systems_to_batch(
         neighbors,
         nef_to_edges_neighbor,
         cell_shifts,
+        positions,
+        neighbor_image_positions,
     )
