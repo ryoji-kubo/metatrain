@@ -100,8 +100,8 @@ or equivalently
 ```math
 \alpha_{ij}
 =
-\frac{c_{ij}\exp(q_i^T k_j/(\sqrt{d_h}T))}
-{\sum_k c_{ik}\exp(q_i^T k_k/(\sqrt{d_h}T))}.
+\frac{c_{ij}\exp(q_i^T k_j/(\sqrt{d_h}^T))}
+{\sum_k c_{ik}\exp(q_i^T k_k/(\sqrt{d_h}^T))}.
 ```
 
 So the cutoff factor is a multiplicative graph prior on attention probability.

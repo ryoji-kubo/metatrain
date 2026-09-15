@@ -27,7 +27,7 @@
       "args": [
         "--debug",
         "train",
-        "options-pet-oam-l-modern-mptrj-salex-direct.yaml",
+        "options-pet-oam-l-modern-mptrj-salex-direct-epoch@50.yaml",
         "-o",
         "pet-oam-l-modern-mptrj-salex-debug.pt",
         "-r",
@@ -45,7 +45,7 @@
         "-r",
         "architecture.training.num_workers=0"
       ],
-      "cwd": "/home/ryoji/equivarient/metatrain",
+      "cwd": "/home/ryoji/metatrain",
       "console": "integratedTerminal",
       "justMyCode": true
     },

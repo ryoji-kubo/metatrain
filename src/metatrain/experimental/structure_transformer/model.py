@@ -14,11 +14,6 @@ from metatomic.torch import (
     System,
 )
 
-from metatrain.pet.modules.adaptive_cutoff import (
-    get_adaptive_cutoffs_grid,
-    get_adaptive_cutoffs_solver,
-)
-from metatrain.pet.modules.utilities import cutoff_func_bump, cutoff_func_cosine
 from metatrain.utils.abc import ModelInterface
 from metatrain.utils.additive import CompositionModel
 from metatrain.utils.data import DatasetInfo, TargetInfo
@@ -26,8 +21,10 @@ from metatrain.utils.dtype import dtype_to_str
 from metatrain.utils.metadata import merge_metadata
 from metatrain.utils.scaler import Scaler
 
+from structure_transformer_core import StructureTransformer, TransformerData
+from structure_transformer_core.graph_attention import build_dense_graph_attention_bias
+
 from .documentation import ModelHypers
-from .modules.transformer import StructureTransformer, TransformerData
 
 
 class StructureTransformerModel(ModelInterface[ModelHypers]):
@@ -257,149 +254,75 @@ class StructureTransformerModel(ModelInterface[ModelHypers]):
             torch.cat(edge_neighbors_list, dim=0),
         )
 
-    def _graph_pair_cutoffs(
-        self,
-        centers: torch.Tensor,
-        neighbors: torch.Tensor,
-        edge_distances: torch.Tensor,
-        num_atoms: int,
-    ) -> torch.Tensor:
-        num_neighbors_adaptive = (
-            self.transformer.graph_attention_num_neighbors_adaptive
-        )
-        if num_neighbors_adaptive is None:
-            return edge_distances.new_full(
-                edge_distances.shape,
-                self.transformer.graph_attention_cutoff,
-            )
-
-        cutoff_method = self.transformer.graph_attention_adaptive_cutoff_method.lower()
-        if cutoff_method == "solver":
-            atomic_cutoffs = get_adaptive_cutoffs_solver(
-                centers,
-                edge_distances,
-                num_neighbors_adaptive,
-                num_atoms,
-                self.transformer.graph_attention_cutoff,
-                cutoff_width=self.transformer.graph_attention_cutoff_width,
-            )
-        elif cutoff_method == "grid":
-            atomic_cutoffs = get_adaptive_cutoffs_grid(
-                centers,
-                edge_distances,
-                num_neighbors_adaptive,
-                num_atoms,
-                self.transformer.graph_attention_cutoff,
-                cutoff_width=self.transformer.graph_attention_cutoff_width,
-            )
-        else:
-            raise RuntimeError("invalid graph attention adaptive cutoff method")
-
-        return (atomic_cutoffs[centers] + atomic_cutoffs[neighbors]) / 2.0
-
-    def _graph_cutoff_factors(
-        self, edge_distances: torch.Tensor, pair_cutoffs: torch.Tensor
-    ) -> torch.Tensor:
-        if self.graph_attention == "binary":
-            return edge_distances.new_ones(edge_distances.shape)
-
-        cutoff_function = self.transformer.graph_attention_cutoff_function.lower()
-        if cutoff_function == "bump":
-            return cutoff_func_bump(
-                edge_distances,
-                pair_cutoffs,
-                self.transformer.graph_attention_cutoff_width,
-            )
-        if cutoff_function == "cosine":
-            return cutoff_func_cosine(
-                edge_distances,
-                pair_cutoffs,
-                self.transformer.graph_attention_cutoff_width,
-            )
-        raise RuntimeError("invalid graph attention cutoff function")
-
-    @staticmethod
-    def _scatter_max_graph_factors(
-        dense_factors: torch.Tensor,
-        centers: torch.Tensor,
-        neighbors: torch.Tensor,
-        edge_factors: torch.Tensor,
-    ) -> None:
-        if centers.numel() == 0:
-            return
-
-        num_atoms = dense_factors.shape[0]
-        flat_index = centers * num_atoms + neighbors
-        flat_factors = dense_factors.reshape(-1)
-        if hasattr(flat_factors, "scatter_reduce_"):
-            flat_factors.scatter_reduce_(
-                0,
-                flat_index,
-                edge_factors,
-                reduce="amax",
-                include_self=True,
-            )
-            return
-
-        for index, value in zip(flat_index.tolist(), edge_factors):
-            flat_factors[index] = torch.maximum(flat_factors[index], value)
-
     def _systems_to_graph_attention_bias(self, systems: List[System]) -> torch.Tensor:
         device = systems[0].positions.device
         dtype = systems[0].positions.dtype
-        batch_size = len(systems)
-        max_atoms = max(len(system) for system in systems)
-        cutoff_factors = torch.zeros(
-            (batch_size, max_atoms, max_atoms),
+
+        atom_counts = torch.tensor(
+            [len(system) for system in systems],
             device=device,
-            dtype=dtype,
+            dtype=torch.long,
+        )
+        batch = torch.repeat_interleave(
+            torch.arange(len(systems), device=device, dtype=torch.long),
+            atom_counts,
         )
 
-        for i_system, system in enumerate(systems):
+        edge_centers_list: List[torch.Tensor] = []
+        edge_neighbors_list: List[torch.Tensor] = []
+        edge_distances_list: List[torch.Tensor] = []
+        atom_offset = 0
+        for system in systems:
             num_atoms = len(system)
-            if num_atoms == 0:
-                continue
-
-            diagonal = torch.arange(num_atoms, device=device)
-            cutoff_factors[i_system, diagonal, diagonal] = 1.0
-
             neighbor_list = system.get_neighbor_list(self.graph_requested_nl)
             samples = neighbor_list.samples.values.to(device=device, dtype=torch.long)
-            if samples.numel() == 0:
-                continue
+            if samples.numel() > 0:
+                edge_vectors = neighbor_list.values.squeeze(-1).to(
+                    device=device,
+                    dtype=dtype,
+                )
+                edge_centers_list.append(samples[:, 0] + atom_offset)
+                edge_neighbors_list.append(samples[:, 1] + atom_offset)
+                edge_distances_list.append(torch.linalg.norm(edge_vectors, dim=-1))
+            atom_offset += num_atoms
 
-            edge_vectors = neighbor_list.values.squeeze(-1).to(
-                device=device,
-                dtype=dtype,
-            )
-            edge_distances = torch.linalg.norm(edge_vectors, dim=-1) + 1.0e-15
-            centers = samples[:, 0]
-            neighbors = samples[:, 1]
-            pair_cutoffs = self._graph_pair_cutoffs(
-                centers, neighbors, edge_distances, num_atoms
-            )
-            if self.transformer.graph_attention_num_neighbors_adaptive is not None:
-                keep = torch.nonzero(edge_distances <= pair_cutoffs).squeeze(-1)
-                if keep.numel() == 0:
-                    continue
-                centers = centers.index_select(0, keep)
-                neighbors = neighbors.index_select(0, keep)
-                edge_distances = edge_distances.index_select(0, keep)
-                pair_cutoffs = pair_cutoffs.index_select(0, keep)
+        if edge_centers_list:
+            centers = torch.cat(edge_centers_list, dim=0)
+            neighbors = torch.cat(edge_neighbors_list, dim=0)
+            edge_distances = torch.cat(edge_distances_list, dim=0)
+        else:
+            centers = torch.empty(0, device=device, dtype=torch.long)
+            neighbors = torch.empty(0, device=device, dtype=torch.long)
+            edge_distances = torch.empty(0, device=device, dtype=dtype)
 
-            edge_factors = self._graph_cutoff_factors(edge_distances, pair_cutoffs)
-            self._scatter_max_graph_factors(
-                cutoff_factors[i_system, :num_atoms, :num_atoms],
-                centers,
-                neighbors,
-                edge_factors,
-            )
-
-        cutoff_factors = cutoff_factors.clamp_min(
-            self.transformer.graph_attention_epsilon
-        )
-        return self.transformer.graph_attention_bias_strength * torch.log(
-            cutoff_factors
+        return build_dense_graph_attention_bias(
+            centers,
+            neighbors,
+            edge_distances,
+            batch,
+            batch_size=len(systems),
+            max_atoms=(
+                int(atom_counts.max().item()) if atom_counts.numel() > 0 else 0
+            ),
+            atom_counts=atom_counts,
+            graph_attention=self.graph_attention,
+            graph_attention_cutoff=self.transformer.graph_attention_cutoff,
+            graph_attention_num_neighbors_adaptive=(
+                self.transformer.graph_attention_num_neighbors_adaptive
+            ),
+            graph_attention_adaptive_cutoff_method=(
+                self.transformer.graph_attention_adaptive_cutoff_method
+            ),
+            graph_attention_cutoff_width=(
+                self.transformer.graph_attention_cutoff_width
+            ),
+            graph_attention_cutoff_function=(
+                self.transformer.graph_attention_cutoff_function
+            ),
+            graph_attention_bias_strength=(
+                self.transformer.graph_attention_bias_strength
+            ),
+            graph_attention_epsilon=self.transformer.graph_attention_epsilon,
         )
 
     def _system_samples(self, systems: List[System], device: torch.device) -> Labels:

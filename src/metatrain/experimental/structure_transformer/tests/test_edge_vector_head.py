@@ -5,8 +5,8 @@ import pytest
 import torch
 from metatomic.torch import ModelOutput, System
 
-import metatrain.experimental.structure_transformer.model as structure_transformer_model
 from metatrain.experimental.structure_transformer import StructureTransformerModel
+import structure_transformer_core.graph_attention as graph_attention_core
 from metatrain.utils.architectures import get_default_hypers
 from metatrain.utils.data import DatasetInfo
 from metatrain.utils.data.target_info import (
@@ -226,7 +226,7 @@ def test_graph_attention_adaptive_cutoff_uses_pet_pair_cutoffs(monkeypatch):
         return edge_distances.new_full((num_nodes,), 1.5)
 
     monkeypatch.setattr(
-        structure_transformer_model,
+        graph_attention_core,
         "get_adaptive_cutoffs_grid",
         fake_grid_adaptive_cutoffs,
     )

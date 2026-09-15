@@ -42,6 +42,7 @@ model:
 | [FlashMD][arch-flashmd]                       | An architecture for the direct prediction of molecular dynamics                                                                      |
 | [DPA3][arch-dpa3]                             | An invariant graph neural network based on line graph series representations                                                         |
 | [Symplectic FlashMD][arch-flashmd_symplectic] | A symplectic variant of FlashMD for the direct prediction of molecular dynamics.                                                     |
+| [GenT][arch-gent] | Experimental Generalized Transformer with coupled node/edge states and PET training. |
 
 <!-- marker-arch-links -->
 
@@ -49,6 +50,7 @@ model:
 on a PR, since the docs use this README file directly.-->
 [arch-dpa3]: https://docs.metatensor.org/metatrain/latest/architectures/generated/dpa3.html
 [arch-flashmd]: https://docs.metatensor.org/metatrain/latest/architectures/generated/flashmd.html
+[arch-gent]: codex-explanations/GenT/GENT_INTEGRATION.md
 [arch-gap]: https://docs.metatensor.org/metatrain/latest/architectures/generated/gap.html
 [arch-mace]: https://docs.metatensor.org/metatrain/latest/architectures/generated/mace.html
 [arch-pet]: https://docs.metatensor.org/metatrain/latest/architectures/generated/pet.html
