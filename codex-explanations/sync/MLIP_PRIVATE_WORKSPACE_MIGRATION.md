@@ -1,69 +1,78 @@
-# Organizing MLIP, metatrain, and equiformer_v3
+# MLIP private workspace migration after branch cleanup
 
-Date: 2026-09-14
+Updated: 2026-09-15
 
-This guide describes the migration to a private MLIP workspace with shared model
-code and two independently maintained framework repositories. Writing this guide
-does not perform the migration. Run the steps in order, inspect each result, and
-stop if a command fails. The code reconciliation and packaging edits are manual
-steps; this document is not a script to execute all at once.
+Branch cleanup is complete. This guide now starts from the cleaned `main` branch
+in each framework and keeps **one maintained branch, `main`, in each repository**.
+The intended setup still uses private framework repositories, Git submodules,
+and public `upstream` remotes.
 
-## Intended result
+Work in two stages:
+
+1. **Steps 1–2: Set up the private repositories and workspace.** The models stay
+   in their current locations inside each framework during this stage.
+2. **Steps 3–8: Consolidate the shared models and validate the wrappers.**
+
+Run one step at a time and stop on errors. The code reconciliation and packaging
+changes are manual edits, not an automatic migration script. This document
+records instructions; the migration has not been performed.
+
+## Verified starting point
+
+The following was checked locally before this guide was updated:
+
+| Repository | Current branch and commit | Working tree |
+| --- | --- | --- |
+| `/home/ryoji/MLIP` | `main` at `f6c5b21` | Clean |
+| `/home/ryoji/metatrain` | `main` at `97b3f8d` | Clean; model and wrapper changes are committed |
+| `/home/ryoji/equiformer_v3` | `main` at `ff34e30` | Tracked files clean; only `matbench-discovery/` is untracked |
+
+The old local metatrain branch `structure-transformer-v37-invariant` still exists,
+but it is fully merged into `main`. It does not need to be deleted or transferred.
+`matbench-discovery/` is a separate Git checkout; keep it separate from this
+migration and do not stage it as framework source.
+
+Both frameworks currently have only `origin`, pointing to their public forks.
+The commands below give the **new submodule checkouts** private origins and the
+original projects as upstreams. The original sibling checkouts retain their
+existing remotes.
+
+## Target layout
 
 ```text
-/home/ryoji/MLIP/                     Git repository: private MLIP
-├── .gitmodules                      Framework URLs and branch preferences
-├── pyproject.toml                   Installable distribution: mlip-models
+/home/ryoji/MLIP/                     Private repository, branch main
+├── .gitmodules                      Records private framework repositories
+├── pyproject.toml                   Shared distribution: mlip-models
 ├── src/
-│   ├── structure_transformer_core/  One shared Structure Transformer core
-│   └── gent_core/                   One shared GenT core
-│       └── tests/                   Existing GenT core tests
-├── tests/                           Additional core and integration tests
+│   ├── structure_transformer_core/
+│   └── gent_core/
+│       └── tests/
+├── tests/                           Shared and cross-framework tests
 ├── notebooks/
-├── metatrain/                       Git submodule: private metatrain copy
-│   └── src/metatrain/experimental/  metatrain-specific wrappers
-└── equiformer_v3/                    Git submodule: private Equiformer copy
-    └── experimental/models/         FairChem-specific wrappers
+├── metatrain/                       Private submodule, branch main
+│   └── src/metatrain/experimental/  metatrain wrappers
+└── equiformer_v3/                    Private submodule, branch main
+    └── experimental/models/         FairChem wrappers
 ```
 
-There will be three private GitHub repositories:
-
-| Repository | Owns | Public upstream |
+| Checkout | `origin`: save your work here | `upstream`: obtain original updates here |
 | --- | --- | --- |
-| `ryoji-kubo/MLIP` | Shared cores, workspace configuration, shared experiments | None required |
-| `ryoji-kubo/metatrain-private` | metatrain and its local wrappers | `metatensor/metatrain` |
-| `ryoji-kubo/equiformer_v3-private` | Equiformer/FairChem and its local wrappers | `atomicarchitects/equiformer_v3` |
+| MLIP | `ryoji-kubo/MLIP` (private, already exists) | None required |
+| MLIP/metatrain | `ryoji-kubo/metatrain-private` (new private repository) | `metatensor/metatrain` |
+| MLIP/equiformer_v3 | `ryoji-kubo/equiformer_v3-private` (new private repository) | `atomicarchitects/equiformer_v3` |
 
-The two new names are suggestions; substitute your chosen names consistently.
-Equiformer's upstream was confirmed from the public
-[fork metadata](https://api.github.com/repos/ryoji-kubo/equiformer_v3).
+MLIP records an exact commit of each framework alongside the shared cores.
+Submodules keep the frameworks' Git histories and remotes independent.
+See [Git's submodule overview](https://git-scm.com/docs/gitsubmodules).
 
-A submodule retains its own Git history and remotes. MLIP stores a reference to a
-particular commit of each framework, alongside the matching shared model code.
-MLIP does not store the framework files as ordinary parent-repository files.
-[Git's submodule overview](https://git-scm.com/docs/gitsubmodules) explains this
-relationship.
+## 1. Create the private framework repositories and transfer main
 
-Each framework's `origin` will point to its private repository; its `upstream`
-will point to the original public project. Nesting repositories under private
-MLIP does not change their visibility. GitHub requires forks of public
-repositories to remain public, so this guide creates independent private copies
-with the original history. See [GitHub's fork visibility rules](https://docs.github.com/en/pull-requests/reference/forks).
+On GitHub, create two **empty private repositories** named `metatrain-private`
+and `equiformer_v3-private`. Leave README, license, and `.gitignore` initialization
+unchecked. Use **New repository**: public forks cannot independently become
+private. See [GitHub's fork visibility rules](https://docs.github.com/en/pull-requests/reference/forks).
 
-## 1. Preserve the current work
-
-At inspection time:
-
-- MLIP is on `main`, with a clean working tree.
-- metatrain is on `structure-transformer-v37-invariant`, with modified and
-  untracked files, including both extracted cores.
-- equiformer_v3 is on `main`, with modified and untracked files, including its
-  extracted Structure Transformer core.
-
-The migration must start from those working versions. A fresh clone of the
-current public forks would omit the uncommitted changes and untracked cores.
-
-Use these variables in one Bash session:
+Use these variables in one Bash session; substitute repository names if desired:
 
 ```bash
 MLIP_ROOT=/home/ryoji/MLIP
@@ -74,200 +83,105 @@ EQUIFORMER_PRIVATE_URL=https://github.com/ryoji-kubo/equiformer_v3-private.git
 MLIP_CONDA=/home/ryoji/miniconda3/bin/conda
 ```
 
-Check the state again:
+Check that the framework checkouts are still on the intended `main` versions:
 
 ```bash
-git -C "$MLIP_ROOT" status --short --branch
 git -C "$METATRAIN_OLD" status --short --branch
 git -C "$EQUIFORMER_OLD" status --short --branch
-du -sh "$MLIP_ROOT" "$METATRAIN_OLD" "$EQUIFORMER_OLD"
-df -h /home/ryoji
-```
-
-Make a filesystem backup or snapshot before changing the repositories. If there
-is sufficient disk space, the following creates a separate backup directory:
-
-```bash
-mlip_backup=$(mktemp -d /home/ryoji/mlip-migration-backup.XXXXXX)
-cp -a "$MLIP_ROOT" "$mlip_backup/MLIP"
-cp -a "$METATRAIN_OLD" "$mlip_backup/metatrain"
-cp -a "$EQUIFORMER_OLD" "$mlip_backup/equiformer_v3"
-```
-
-Record the backup path. These copies include `.git`, untracked files, and ignored
-files. Symlinks remain symlinks; independently back up external targets if needed.
-Pause writers such as training jobs while taking a consistent backup, or use a
-filesystem snapshot. A Git bundle alone would not preserve uncommitted files.
-
-Keep the original folders throughout validation. The new workspace will use new
-submodule checkouts, so there is no need to move or delete either original folder.
-
-## 2. Create the two private GitHub repositories
-
-On GitHub, use **New repository** to create:
-
-1. `ryoji-kubo/metatrain-private`, with visibility **Private**.
-2. `ryoji-kubo/equiformer_v3-private`, with visibility **Private**.
-
-Leave both empty: do not initialize a README, `.gitignore`, or license. These are
-independent repositories; do not use the Fork button. Keep the existing private
-MLIP repository.
-
-Git history will be transferred by pushing your existing branches. Issues, PRs,
-Actions secrets, and repository settings need separate setup if you want them.
-The existing public forks will remain public; creating private copies does not
-remove already published code.
-
-## 3. Checkpoint the working versions and push them privately
-
-First fetch the public forks' branch information while `origin` still refers to
-them:
-
-```bash
 git -C "$METATRAIN_OLD" fetch origin --tags
-git -C "$METATRAIN_OLD" branch -a
 git -C "$EQUIFORMER_OLD" fetch origin --tags
-git -C "$EQUIFORMER_OLD" branch -a
+git -C "$METATRAIN_OLD" log --oneline main..origin/main
+git -C "$EQUIFORMER_OLD" log --oneline main..origin/main
 ```
 
-If a checkout is shallow (`git rev-parse --is-shallow-repository` prints `true`),
-run `git fetch --unshallow origin` in that checkout before proceeding. If it uses
-Git LFS, run `git lfs fetch --all origin` now, while `origin` still points to the
-public fork, to download its LFS payloads.
+The last two commands should show no additional remote commits. If they do,
+update the relevant local `main` before transferring it. Commit any new work you
+want included, such as this revised guide, **locally** before the transfer.
+There is no need to repeat the earlier model checkpoint or branch-merging steps.
 
-The later `push --all` transfers all **local branches**. For any additional
-remote-only branch you want to preserve, first create a local branch at its
-`origin/BRANCH` commit using `git branch BRANCH origin/BRANCH`. Do not replace an
-existing local branch. Stashes and ignored files remain in the original checkout
-and backup; they are not transferred by pushing branches.
+If a checkout is shallow (`git rev-parse --is-shallow-repository` reports `true`),
+fetch its full history with `git fetch --unshallow origin` before continuing.
+If it uses Git LFS, fetch its LFS payloads from its existing origin before
+transferring them to the private repository; see
+[GitHub's repository duplication guide](https://docs.github.com/en/repositories/creating-and-managing-repositories/duplicating-a-repository).
 
-Now change the push destinations to the new private repositories:
+Transfer **main and tags** directly to the private URLs:
 
 ```bash
-git -C "$METATRAIN_OLD" remote set-url origin "$METATRAIN_PRIVATE_URL"
-git -C "$METATRAIN_OLD" remote set-url --push origin "$METATRAIN_PRIVATE_URL"
-git -C "$METATRAIN_OLD" remote add upstream https://github.com/metatensor/metatrain.git
-git -C "$METATRAIN_OLD" config remote.pushDefault origin
-
-git -C "$EQUIFORMER_OLD" remote set-url origin "$EQUIFORMER_PRIVATE_URL"
-git -C "$EQUIFORMER_OLD" remote set-url --push origin "$EQUIFORMER_PRIVATE_URL"
-git -C "$EQUIFORMER_OLD" remote add upstream https://github.com/atomicarchitects/equiformer_v3.git
-git -C "$EQUIFORMER_OLD" config remote.pushDefault origin
-
-git -C "$METATRAIN_OLD" remote -v
-git -C "$EQUIFORMER_OLD" remote -v
+git -C "$METATRAIN_OLD" push "$METATRAIN_PRIVATE_URL" main
+git -C "$METATRAIN_OLD" push "$METATRAIN_PRIVATE_URL" --tags
+git -C "$EQUIFORMER_OLD" push "$EQUIFORMER_PRIVATE_URL" main
+git -C "$EQUIFORMER_OLD" push "$EQUIFORMER_PRIVATE_URL" --tags
 ```
 
-Both fetch and push entries for each `origin` must show its private URL. If an
-`upstream` already exists when you perform this migration, check its URL and use
-`remote set-url upstream ...` instead of adding it again.
+These commands preserve the history reachable from `main` and the tags, without
+creating the old feature branches in the private repositories. Tags also support
+the frameworks' existing version-generation mechanisms. If Git LFS is in use,
+upload the downloaded LFS objects to the private destination as well.
 
-Create a branch named `mlip-integration` in each original checkout, starting from
-its current branch. For metatrain, this preserves the work based on
-`structure-transformer-v37-invariant`; do not switch to `main` first.
+Verify that each new GitHub repository is private and its default branch is
+`main`. GitHub issues, PRs, and repository settings are separate from Git history.
+The existing public forks remain public; this step does not hide already
+published code.
 
-```bash
-cd "$METATRAIN_OLD"
-git switch -c mlip-integration
-git add -p
-git add src/structure_transformer_core src/gent_core
-git add src/metatrain/experimental/structure_transformer src/metatrain/experimental/gent
-git add codex-explanations/sync
-git status --short
-```
+Keep both original folders in place until validation is complete. Their ignored
+files, datasets, local environment settings, and separate Matbench checkout stay
+there; only committed source is cloned into the new workspace. Preserve those
+local assets through your existing backups and transfer them selectively when
+needed.
 
-`git add -p` lets you review modifications to tracked files. Explicitly stage the
-other new configuration files, scripts, documentation, and tests needed for your
-working version. Inspect `git ls-files --others --exclude-standard` to find them.
-Review staged changes before committing:
+## 2. Add the private frameworks as submodules under MLIP
 
-```bash
-git diff --cached --stat
-git diff --cached --check
-git commit -m "Checkpoint models and wrappers before MLIP migration"
-```
-
-Do the same for Equiformer:
-
-```bash
-cd "$EQUIFORMER_OLD"
-git switch -c mlip-integration
-git add -p
-git add src/structure_transformer_core
-git add experimental/models/transformer
-git add tests/core/models/test_structure_transformer_core_sync.py
-git status --short
-```
-
-Stage any additional required experiment configurations and source files, then:
-
-```bash
-git diff --cached --stat
-git diff --cached --check
-git commit -m "Checkpoint models and wrappers before MLIP migration"
-```
-
-Keep datasets, checkpoints, generated outputs, and the separate
-`matbench-discovery/` checkout out of these source commits. Avoid staging that
-nested checkout as an accidental embedded repository. Record its version and
-installation separately if your experiments use it.
-
-Before proceeding, ensure all code needed to reproduce the current working
-models is committed. Unrelated local files may remain in the original folders,
-but the new submodule clones will only receive committed files.
-
-Push the local branches and tags to the verified private destinations:
-
-```bash
-git -C "$METATRAIN_OLD" push -u origin --all
-git -C "$METATRAIN_OLD" push origin --tags
-git -C "$EQUIFORMER_OLD" push -u origin --all
-git -C "$EQUIFORMER_OLD" push origin --tags
-```
-
-If either repository uses Git LFS, run `git lfs push --all origin` inside that
-checkout to upload the LFS payloads downloaded earlier. `origin` now points to
-its private destination. Git branches alone do not copy LFS payloads; see
-[GitHub's duplication guide](https://docs.github.com/en/repositories/creating-and-managing-repositories/duplicating-a-repository).
-
-On GitHub, set `mlip-integration` as the default branch of each new private
-framework repository. The original `main` and feature branches remain available.
-
-## 4. Add the frameworks as submodules under MLIP
-
-Start with a clean MLIP working tree, and update its existing `main`:
+Starting from a clean MLIP working tree:
 
 ```bash
 cd "$MLIP_ROOT"
 git switch main
 git pull --ff-only origin main
-git switch -c organize-shared-models
 
-git submodule add -b mlip-integration "$METATRAIN_PRIVATE_URL" metatrain
-git submodule add -b mlip-integration "$EQUIFORMER_PRIVATE_URL" equiformer_v3
+git submodule add -b main "$METATRAIN_PRIVATE_URL" metatrain
+git submodule add -b main "$EQUIFORMER_PRIVATE_URL" equiformer_v3
 git config push.recurseSubmodules check
-git submodule status
 ```
 
-The `metatrain/` and `equiformer_v3/` paths must not already contain files. These
-commands clone from the private repositories, including the checkpoint commits.
-The `-b` option records a branch preference; MLIP still records exact commits.
-See [Git's submodule commands](https://git-scm.com/docs/git-submodule).
-
-The new clones do not inherit remotes from the original local checkouts. Add
-their upstreams explicitly:
+The destination folders must not already contain files. Git automatically sets
+`origin` in each new submodule to its private URL. Add the original public
+projects as additional remotes:
 
 ```bash
 git -C "$MLIP_ROOT/metatrain" remote add upstream https://github.com/metatensor/metatrain.git
 git -C "$MLIP_ROOT/metatrain" config remote.pushDefault origin
 git -C "$MLIP_ROOT/equiformer_v3" remote add upstream https://github.com/atomicarchitects/equiformer_v3.git
 git -C "$MLIP_ROOT/equiformer_v3" config remote.pushDefault origin
+
+git -C "$MLIP_ROOT/metatrain" remote -v
+git -C "$MLIP_ROOT/equiformer_v3" remote -v
+git submodule status
 ```
 
-Do not add these two directories to MLIP's `.gitignore`. Git should track them as
-submodules, with their URLs in `.gitmodules`.
+Each `origin` must show its private URL and each `upstream` the original project.
+If repeating setup on a checkout that already has `upstream`, inspect its URL
+and use `remote set-url upstream ...` if a correction is needed.
 
-## 5. Establish the shared cores under MLIP
+Save this workspace setup:
+
+```bash
+cd "$MLIP_ROOT"
+git add .gitmodules metatrain equiformer_v3
+git diff --cached --submodule=log
+git commit -m "Track private framework copies as submodules"
+git push origin main
+```
+
+**Stage one is complete.** You now have private framework copies under MLIP,
+with their upstream connections preserved. Continue all new development inside
+these submodules. The original sibling folders remain references.
+
+The shared models are still duplicated at this point. The remaining steps make
+both frameworks use a single implementation. They can be handled separately
+from the repository setup.
+
+## 3. Establish the shared cores under MLIP
 
 Create the shared source directory and copy the current metatrain versions as
 the starting point:
@@ -318,7 +232,7 @@ The test already imports `Path`. This lookup works with the new location and
 with an installed package. Keep the original source attribution and notices
 when extracting files into MLIP.
 
-## 6. Make the cores an installable Python distribution
+## 4. Make the cores an installable Python distribution
 
 Create `/home/ryoji/MLIP/pyproject.toml` with this initial configuration:
 
@@ -372,11 +286,11 @@ __pycache__/
 /dist/
 ```
 
-## 7. Make both frameworks depend on the shared distribution
+## 5. Make both frameworks depend on the shared distribution
 
 After reconciling the cores, remove the duplicate core packages from the **new
-submodule checkouts**. Step 3 made them tracked files, so these removals will be
-recorded in Git:
+submodule checkouts**. The cores are already tracked on the cleaned framework
+branches, so these removals will be recorded in Git:
 
 ```bash
 git -C "$MLIP_ROOT/metatrain" rm -r src/structure_transformer_core src/gent_core
@@ -407,7 +321,7 @@ names during extraction. In particular, the FairChem wrapper currently
 subclasses the core, while metatrain wraps it. Changing that relationship can
 affect old checkpoints even when the mathematical model is unchanged.
 
-## 8. Install the workspace into separate development environments
+## 6. Install the workspace into separate development environments
 
 Keep separate environments for metatrain and Equiformer. To preserve the current
 working environments during migration, clone them first:
@@ -417,8 +331,8 @@ working environments during migration, clone them first:
 "$MLIP_CONDA" create --name mlip-equiformer --clone equiformer_v3
 ```
 
-These source environment names come from the existing sync notes; substitute
-the names of your actual working environments if they have changed. If the new
+Both source environments were found during the 2026-09-15 inspection; substitute
+the names of your working environments if they have changed. If the new
 environment names already exist, inspect them before reusing them.
 
 Reinstall the local packages from the new paths:
@@ -467,7 +381,7 @@ Ignored data, results, local IDE settings, and separately cloned dependencies ar
 not copied by submodule cloning; transfer needed local files selectively or
 configure their existing locations.
 
-## 9. Verify imports and behavior
+## 7. Verify imports and behavior
 
 First verify that both environments load both cores from MLIP:
 
@@ -522,7 +436,7 @@ cd "$MLIP_ROOT/equiformer_v3"
 
 These are instructions to run tests; this document does not claim they already
 pass. Earlier sync notes reported missing pytest in the original environments,
-and the current GenT reference-path issue is described in step 5.
+and the current GenT reference-path issue is described in step 3.
 
 Before treating the migration as complete:
 
@@ -542,10 +456,11 @@ Before treating the migration as complete:
 Keep model behavior changes separate from directory and packaging changes where
 possible, so failures can be attributed to the right change.
 
-## 10. Publish the framework commits, then the MLIP commit
+## 8. Publish the framework changes, then the shared cores
 
-Review and commit the wrapper, packaging, and duplicate-removal changes inside
-each framework. Stage any additional files you deliberately changed in step 7:
+After the checks in step 7 pass, commit the wrapper, packaging, and duplicate
+removals inside each framework. The new submodule checkouts should still be on
+`main`. Review the staged changes and explicitly stage any new files you added:
 
 ```bash
 cd "$MLIP_ROOT/metatrain"
@@ -553,140 +468,112 @@ git add -u
 git diff --cached --stat
 git diff --cached --check
 git commit -m "Use shared model cores from MLIP"
-git push origin mlip-integration
+git push origin main
 
 cd "$MLIP_ROOT/equiformer_v3"
 git add -u
 git diff --cached --stat
 git diff --cached --check
 git commit -m "Use shared model cores from MLIP"
-git push origin mlip-integration
+git push origin main
 ```
 
-Then stage MLIP's shared source, packaging, and exact submodule commits:
+Then commit MLIP's shared source, packaging, tests, and matching framework
+commit references. Stage any other new setup files you deliberately created:
 
 ```bash
 cd "$MLIP_ROOT"
-git add .gitmodules pyproject.toml src metatrain equiformer_v3
+git add pyproject.toml src tests metatrain equiformer_v3
 git add -p
 git status --short
-```
-
-Explicitly stage the new tests and any new workspace setup files you added.
-Review the complete staged change and publish the workspace branch:
-
-```bash
 git diff --cached --submodule=log
 git diff --cached --check
-git commit -m "Organize shared model cores and private framework submodules"
-git push -u origin organize-shared-models
+git commit -m "Share model cores between metatrain and Equiformer"
+git push origin main
 ```
 
-Publishing the framework commits first ensures that a new clone can fetch every
-commit referenced by MLIP. A parent commit records submodule commit IDs; it does
-not upload their contents. The local `push.recurseSubmodules=check` setting adds
-a useful check, but keep the explicit child-first publishing order.
+Always push the framework commits first so another machine can fetch the
+commits referenced by MLIP. A parent push does not upload submodule changes.
+The `push.recurseSubmodules=check` setting helps detect missing child commits.
 
-## 11. Confirm that the workspace can be recreated
+## Check a fresh clone
 
-Before merging the MLIP branch into `main`, try a separate clone:
+Confirm that all three repositories can be downloaded together:
 
 ```bash
 mlip_check=$(mktemp -d /home/ryoji/mlip-check.XXXXXX)
-git clone --branch organize-shared-models --recurse-submodules \
+git clone --branch main --recurse-submodules \
   https://github.com/ryoji-kubo/MLIP.git "$mlip_check"
 git -C "$mlip_check" submodule status --recursive
 git -C "$mlip_check" status --short
 ```
 
-Anyone doing this needs access to all three private repositories. On a separate
-validation environment or machine, repeat the installations and import checks
-with `MLIP_ROOT` set to the new clone. Do not repoint the working development
-environments just to validate a disposable clone.
+A new user or machine needs access to all three private repositories. Repeat
+the installations and import checks in separate validation environments with
+`MLIP_ROOT` set to the new clone. Keep working environments pointed at the
+primary workspace.
 
-Once the clone and relevant tests work, merge `organize-shared-models` into MLIP's
-`main`. Return the primary workspace to the merged branch:
+For an existing clone, `git submodule update --init --recursive` checks out the
+versions recorded by MLIP. Submodules are normally checked out at detached HEADs;
+before editing a framework, switch it to `main`. Its branch may be newer than
+MLIP's pinned version, so review that difference before recording it in MLIP.
+
+Extra `upstream` remotes and local Git settings are not copied by cloning.
+Repeat the upstream setup from step 2 in each fresh workspace. `.gitmodules`
+provides the private origin URLs and branch preferences; MLIP still pins exact
+commits. See [Git's submodule commands](https://git-scm.com/docs/git-submodule).
+
+Keep the original folders until experiments, notebooks, and data paths work
+from MLIP. Archiving those folders is a separate, later cleanup task.
+
+## Later: merge changes from the original projects
+
+You can keep working on `main` in both frameworks. Start from clean working trees
+and bring MLIP's own `main` up to date before recording a framework update.
+For example, update metatrain with:
 
 ```bash
 cd /home/ryoji/MLIP
 git switch main
 git pull --ff-only origin main
 git submodule update --init --recursive
-```
 
-Future normal clones, run from the directory where you want a new MLIP folder,
-can use:
-
-```bash
-git clone --recurse-submodules https://github.com/ryoji-kubo/MLIP.git
-```
-
-If you cloned without submodules, initialize them from inside MLIP:
-
-```bash
-git submodule update --init --recursive
-```
-
-Fresh submodule checkouts are normally at detached HEADs. Before making changes,
-switch to `mlip-integration`, or create a feature branch from the pinned commit.
-Switching to a branch may select a different commit from the one recorded in
-MLIP; inspect that difference before updating the parent reference.
-
-Additional `upstream` remotes and local Git settings are not inherited by a new
-clone. Repeat the upstream setup from step 4 in each new workspace. `.gitmodules`
-records the private origins, not those extra local remotes.
-
-Keep the original folders and backups until your normal experiments, data paths,
-and notebook environments work from MLIP. Archiving the old copies can be a later
-cleanup task.
-
-## 12. Bring in upstream changes after migration
-
-Work with a clean tree. The following example updates metatrain; choose a new
-sync branch name for each update:
-
-```bash
 cd /home/ryoji/MLIP/metatrain
-git switch mlip-integration
-git pull --ff-only origin mlip-integration
+git switch main
+git pull --ff-only origin main
 git fetch upstream
-git switch -c sync/metatrain-2026-09-14
 git merge upstream/main
 ```
 
-If there are conflicts, resolve them, stage the resolutions, and finish with
-`git merge --continue`. To abandon an in-progress merge, use `git merge --abort`.
-Run the relevant wrapper tests against the shared cores, then publish the branch:
+Resolve any conflicts, stage the resolutions, and finish an interrupted merge
+with `git merge --continue`. Use `git merge --abort` to abandon an in-progress
+merge. Run the relevant wrapper tests from step 7 before publishing the result.
+If tests fail after a completed merge, resolve those failures before pushing.
 
-```bash
-git push -u origin HEAD
-```
-
-Open a PR in **metatrain-private**, targeting `mlip-integration`. Merge it using a
-normal merge commit so the upstream ancestry remains recorded. Avoid squash
-merging this upstream-sync PR, which would discard that ancestry relationship.
-
-After the PR is merged:
+After validation:
 
 ```bash
 cd /home/ryoji/MLIP/metatrain
-git switch mlip-integration
-git pull --ff-only origin mlip-integration
+git push origin main
 
 cd /home/ryoji/MLIP
 git add metatrain
 git diff --cached --submodule=log
 git commit -m "Update metatrain to tested upstream integration"
-git push origin HEAD
+git push origin main
 ```
 
-Do the equivalent for `equiformer_v3`, using its own sync branch and its own
-`upstream/main`. You can update and validate the two frameworks independently.
+For Equiformer, use the same sequence inside `MLIP/equiformer_v3`, then stage
+`equiformer_v3` in MLIP. Each framework's `upstream` refers to its own original
+project, so updates can be merged and tested independently.
 
-`git submodule update --init --recursive` checks out the versions recorded by
-MLIP. It does not merge original upstream changes. With this setup,
-`git submodule update --remote` would follow the private framework branch; it
-also does not perform the upstream integration described above.
+Use ordinary merges for upstream updates to retain their ancestry. If branch
+protection requires a PR, use a temporary review branch and merge that PR with a
+merge commit. Only `main` needs to remain as the maintained branch.
+
+`git submodule update --init --recursive` restores MLIP's recorded versions.
+`git submodule update --remote` follows the private framework branches. Neither
+command performs the merge from the original public upstream described above.
 
 ## Where to commit daily changes
 
